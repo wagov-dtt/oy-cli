@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import os
 import shlex
@@ -449,12 +448,14 @@ def resolve_path(root: Path, raw: str) -> Path:
     return path
 
 
-def list_tool(root: Path, path: str = ".", limit: int = 200) -> str:
-    target = resolve_path(root, path)
+def tool_list(deps: AgentDeps, path: str = ".", limit: int = 200) -> str:
+    """List files and directories in a workspace directory. Use this instead of `bash` with `ls`."""
+    note_tool_call(deps, "list", render_tool_details(path=path, limit=limit))
+    target = resolve_path(deps.root, path)
     if not target.is_dir():
         raise ValueError("path is not a directory")
     items = [
-        rel(root, item) + ("/" if item.is_dir() else "")
+        rel(deps.root, item) + ("/" if item.is_dir() else "")
         for item in sorted(target.iterdir())[: max(limit, 1)]
     ]
     output = clip("\n".join(items) or "<empty directory>")
@@ -462,10 +463,12 @@ def list_tool(root: Path, path: str = ".", limit: int = 200) -> str:
     return output
 
 
-def read_tool(root: Path, path: str, offset: int = 1, limit: int = 200) -> str:
-    target = resolve_path(root, path)
+def tool_read(deps: AgentDeps, path: str, offset: int = 1, limit: int = 200) -> str:
+    """Read a file in the workspace. Use this instead of `cat`, `head`, or `tail`."""
+    note_tool_call(deps, "read", render_tool_details(path=path, offset=offset, limit=limit))
+    target = resolve_path(deps.root, path)
     if target.is_dir():
-        return list_tool(root, path, limit)
+        return tool_list(deps, path, limit)
     lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
     start = max(offset, 1) - 1
     body = [
@@ -475,22 +478,38 @@ def read_tool(root: Path, path: str, offset: int = 1, limit: int = 200) -> str:
     return clip("\n".join(body) or "<empty file>")
 
 
-def write_tool(root: Path, path: str, content: str) -> str:
-    target = resolve_path(root, path)
+def tool_write(deps: AgentDeps, path: str, content: str) -> str:
+    """Create or overwrite a file in the workspace."""
+    note_tool_call(deps, "write", render_tool_details(path=path, chars=len(content)))
+    target = resolve_path(deps.root, path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
-    result = f"wrote {rel(root, target)} ({len(content)} chars)"
+    result = f"wrote {rel(deps.root, target)} ({len(content)} chars)"
     print_preview(result, lines=1)
     return result
 
 
-def edit_tool(
-    root: Path, path: str, old_text: str, new_text: str, replace_all: bool = False
+def tool_edit(
+    deps: AgentDeps,
+    path: str,
+    old_text: str,
+    new_text: str,
+    replace_all: bool = False,
 ) -> str:
-    """Replace text in an existing workspace file using fuzzy patch matching."""
+    """Replace text in an existing workspace file using fuzzy patch matching for resilience."""
+    note_tool_call(
+        deps,
+        "edit",
+        render_tool_details(
+            path=path,
+            old_chars=len(old_text),
+            new_chars=len(new_text),
+            replace_all=replace_all,
+        ),
+    )
     if not old_text:
         raise ValueError("old_text must not be empty")
-    target = resolve_path(root, path)
+    target = resolve_path(deps.root, path)
     text = target.read_text(encoding="utf-8", errors="replace")
     count = text.count(old_text)
     if count == 0:
@@ -501,7 +520,7 @@ def edit_tool(
     if replace_all:
         # Replace all occurrences directly
         target.write_text(text.replace(old_text, new_text), encoding="utf-8")
-        result = f"edited {rel(root, target)} ({count} replacement{'s' if count != 1 else ''})"
+        result = f"edited {rel(deps.root, target)} ({count} replacement{'s' if count != 1 else ''})"
         print_preview(result, lines=1)
         return result
 
@@ -529,7 +548,7 @@ def edit_tool(
     patch_text = "".join(diff_lines)
     if not patch_text:
         # No changes needed
-        result = f"edited {rel(root, target)} (no changes)"
+        result = f"edited {rel(deps.root, target)} (no changes)"
         print_preview(result, lines=1)
         return result
 
@@ -542,7 +561,7 @@ def edit_tool(
                 "patch",
                 "--strip=1",
                 "--directory",
-                str(root),
+                str(deps.root),
                 "--input",
                 patch_file,
                 "--forward",
@@ -556,12 +575,14 @@ def edit_tool(
     if result_proc.returncode != 0:
         raise ValueError(clip(f"patch failed: {result_proc.stderr.strip()}"))
 
-    result = f"edited {rel(root, target)} (1 replacement)"
+    result = f"edited {rel(deps.root, target)} (1 replacement)"
     print_preview(result, lines=1)
     return result
 
 
-def patch_tool(root: Path, patch_text: str) -> str:
+def tool_patch(deps: AgentDeps, patch_text: str) -> str:
+    """Apply a unified diff inside the workspace."""
+    note_tool_call(deps, "patch", render_tool_details(chars=len(patch_text)))
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
         handle.write(patch_text)
         patch_file = handle.name
@@ -571,7 +592,7 @@ def patch_tool(root: Path, patch_text: str) -> str:
                 "patch",
                 "--strip=0",
                 "--directory",
-                str(root),
+                str(deps.root),
                 "--input",
                 patch_file,
                 "--forward",
@@ -587,16 +608,31 @@ def patch_tool(root: Path, patch_text: str) -> str:
     return clip(output)
 
 
-def bash_tool(root: Path, command: str, timeout_seconds: int = 120) -> str:
-    result = run(["bash", "-lc", command], cwd=root, timeout=timeout_seconds)
+def tool_bash(deps: AgentDeps, command: str, timeout_seconds: int = 120) -> str:
+    """Last resort: run shell commands for builds, tests, git, package managers, or other real terminal tasks."""
+    note_tool_call(
+        deps,
+        "bash",
+        render_tool_details(command=command, timeout=timeout_seconds),
+    )
+    result = run(["bash", "-lc", command], cwd=deps.root, timeout=timeout_seconds)
     output = f"exit_code: {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}".strip()
     print_preview(output, lines=3)
     return clip(output)
 
 
-def grep_tool(
-    root: Path, pattern: str, path: str = ".", file_glob: str | None = None
+def tool_grep(
+    deps: AgentDeps,
+    pattern: str,
+    path: str = ".",
+    file_glob: str | None = None,
 ) -> str:
+    """Search workspace file contents with ripgrep. Use this instead of `grep` or `rg` in bash."""
+    note_tool_call(
+        deps,
+        "grep",
+        render_tool_details(pattern=pattern, path=path, glob=file_glob),
+    )
     command = [
         "rg",
         "--line-number",
@@ -609,7 +645,7 @@ def grep_tool(
     ]
     if file_glob:
         command.extend(["--glob", file_glob])
-    command.extend([pattern, str(resolve_path(root, path))])
+    command.extend([pattern, str(resolve_path(deps.root, path))])
     result = run(command)
     if result.returncode not in (0, 1):
         raise ValueError(result.stderr.strip() or "rg failed")
@@ -618,10 +654,12 @@ def grep_tool(
     return clip(output)
 
 
-def glob_tool(root: Path, pattern: str, path: str = ".") -> str:
-    base = resolve_path(root, path)
+def tool_glob(deps: AgentDeps, pattern: str, path: str = ".") -> str:
+    """Find files or directories with glob patterns. Use this instead of `find` in bash."""
+    note_tool_call(deps, "glob", render_tool_details(pattern=pattern, path=path))
+    base = resolve_path(deps.root, path)
     items = [
-        rel(root, match) + ("/" if match.is_dir() else "")
+        rel(deps.root, match) + ("/" if match.is_dir() else "")
         for match in sorted(base.glob(pattern))[:200]
     ]
     output = "\n".join(items) or "<no matches>"
@@ -629,7 +667,9 @@ def glob_tool(root: Path, pattern: str, path: str = ".") -> str:
     return clip(output)
 
 
-def webfetch_tool(url: str, max_chars: int = MAX_CHARS) -> str:
+def tool_webfetch(deps: AgentDeps, url: str, max_chars: int = MAX_CHARS) -> str:
+    """Fetch a web page over HTTP or HTTPS. Use this to get up-to-date documentation, library references, or API details from the web. Follows redirects automatically."""
+    note_tool_call(deps, "webfetch", render_tool_details(url=url, max_chars=max_chars))
     parsed = urlparse(url)
     if not parsed.scheme:
         url = f"https://{url}"
@@ -673,91 +713,6 @@ def note_tool_call(deps: AgentDeps, name: str, details: str = "") -> None:
         console.print(f"[bright_black]▸[/] [bold]{name}[/]", highlight=False)
 
 
-# Tool implementations that take AgentDeps directly
-def tool_write(deps: AgentDeps, path: str, content: str) -> str:
-    """Create or overwrite a file in the workspace."""
-    note_tool_call(deps, "write", render_tool_details(path=path, chars=len(content)))
-    return write_tool(deps.root, path, content)
-
-
-def tool_edit(
-    deps: AgentDeps,
-    path: str,
-    old_text: str,
-    new_text: str,
-    replace_all: bool = False,
-) -> str:
-    """Replace text in an existing workspace file using fuzzy patch matching for resilience."""
-    note_tool_call(
-        deps,
-        "edit",
-        render_tool_details(
-            path=path,
-            old_chars=len(old_text),
-            new_chars=len(new_text),
-            replace_all=replace_all,
-        ),
-    )
-    return edit_tool(deps.root, path, old_text, new_text, replace_all)
-
-
-def tool_patch(deps: AgentDeps, patch_text: str) -> str:
-    """Apply a unified diff inside the workspace."""
-    note_tool_call(deps, "patch", render_tool_details(chars=len(patch_text)))
-    return patch_tool(deps.root, patch_text)
-
-
-def tool_list(deps: AgentDeps, path: str = ".", limit: int = 200) -> str:
-    """List files and directories in a workspace directory. Use this instead of `bash` with `ls`."""
-    note_tool_call(deps, "list", render_tool_details(path=path, limit=limit))
-    return list_tool(deps.root, path, limit)
-
-
-def tool_bash(deps: AgentDeps, command: str, timeout_seconds: int = 120) -> str:
-    """Last resort: run shell commands for builds, tests, git, package managers, or other real terminal tasks."""
-    note_tool_call(
-        deps,
-        "bash",
-        render_tool_details(command=command, timeout=timeout_seconds),
-    )
-    return bash_tool(deps.root, command, timeout_seconds)
-
-
-def tool_read(deps: AgentDeps, path: str, offset: int = 1, limit: int = 200) -> str:
-    """Read a file in the workspace. Use this instead of `cat`, `head`, or `tail`."""
-    note_tool_call(
-        deps, "read", render_tool_details(path=path, offset=offset, limit=limit)
-    )
-    return read_tool(deps.root, path, offset, limit)
-
-
-def tool_grep(
-    deps: AgentDeps,
-    pattern: str,
-    path: str = ".",
-    file_glob: str | None = None,
-) -> str:
-    """Search workspace file contents with ripgrep. Use this instead of `grep` or `rg` in bash."""
-    note_tool_call(
-        deps,
-        "grep",
-        render_tool_details(pattern=pattern, path=path, glob=file_glob),
-    )
-    return grep_tool(deps.root, pattern, path, file_glob)
-
-
-def tool_glob(deps: AgentDeps, pattern: str, path: str = ".") -> str:
-    """Find files or directories with glob patterns. Use this instead of `find` in bash."""
-    note_tool_call(deps, "glob", render_tool_details(pattern=pattern, path=path))
-    return glob_tool(deps.root, pattern, path)
-
-
-def tool_webfetch(deps: AgentDeps, url: str, max_chars: int = MAX_CHARS) -> str:
-    """Fetch a web page over HTTP or HTTPS. Use this to get up-to-date documentation, library references, or API details from the web. Follows redirects automatically."""
-    note_tool_call(deps, "webfetch", render_tool_details(url=url, max_chars=max_chars))
-    return webfetch_tool(url, max_chars)
-
-
 def _format_size(size: int) -> str:
     """Format byte size to human readable string."""
     if size < 1024:
@@ -770,11 +725,6 @@ def _format_size(size: int) -> str:
 
 def tool_history(deps: AgentDeps, n: int = 3) -> str:
     """View the last N command outputs from this workspace history."""
-    # Handle n that might come as string from LLM
-    try:
-        n = int(n) if n is not None else 3
-    except ValueError, TypeError:
-        n = 3
     note_tool_call(deps, "history", render_tool_details(n=n))
     entries = load_history(deps.root)
     if not entries:
@@ -815,50 +765,161 @@ TOOLS = {
 }
 
 
-def _schema_from_func(name: str, func: callable) -> dict[str, Any]:
-    """Generate an OpenAI function schema from a tool function's signature."""
-    sig = inspect.signature(func)
-    doc = inspect.getdoc(func) or ""
-    description = doc.split("\n\n")[0].strip() if doc else ""
-
-    properties: dict[str, Any] = {}
-    required: list[str] = []
-
-    for pname, param in sig.parameters.items():
-        if pname == "deps":
-            continue
-
-        annotation = param.annotation
-        if annotation is str:
-            ptype = "string"
-        elif annotation is int:
-            ptype = "integer"
-        elif annotation is bool:
-            ptype = "boolean"
-        elif annotation is float:
-            ptype = "number"
-        else:
-            ptype = "string"
-
-        properties[pname] = {"type": ptype}
-        if param.default is inspect.Parameter.empty:
-            required.append(pname)
-
-    schema: dict[str, Any] = {
+# Explicit tool schemas for OpenAI function calling
+TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
         "type": "function",
         "function": {
-            "name": name,
-            "description": description,
-            "parameters": {"type": "object", "properties": properties},
+            "name": "write",
+            "description": "Create or overwrite a file in the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
         },
-    }
-    if required:
-        schema["function"]["parameters"]["required"] = required
-    return schema
-
-
-# Generate TOOL_SCHEMAS from tool function signatures
-TOOL_SCHEMAS = [_schema_from_func(name, func) for name, func in TOOLS.items()]
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit",
+            "description": "Replace text in an existing workspace file using fuzzy patch matching for resilience.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                    "replace_all": {"type": "boolean"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "patch",
+            "description": "Apply a unified diff inside the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch_text": {"type": "string"},
+                },
+                "required": ["patch_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list",
+            "description": "List files and directories in a workspace directory. Use this instead of `bash` with `ls`.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Last resort: run shell commands for builds, tests, git, package managers, or other real terminal tasks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout_seconds": {"type": "integer"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Read a file in the workspace. Use this instead of `cat`, `head`, or `tail`.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search workspace file contents with ripgrep. Use this instead of `grep` or `rg` in bash.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string"},
+                    "file_glob": {"type": "string"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": "Find files or directories with glob patterns. Use this instead of `find` in bash.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "webfetch",
+            "description": "Fetch a web page over HTTP or HTTPS. Use this to get up-to-date documentation, library references, or API details from the web. Follows redirects automatically.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "max_chars": {"type": "integer"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "history",
+            "description": "View the last N command outputs from this workspace history.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "n": {"type": "integer"},
+                },
+                "required": [],
+            },
+        },
+    },
+]
 
 
 def list_model_ids() -> list[str]:
