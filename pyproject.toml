@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oy-cli"
-version = "0.1.1"
+version = "0.1.2"
 description = "Tiny local coding CLI with a small tool surface"
 readme = "README.md"
 requires-python = ">=3.14"

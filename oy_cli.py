@@ -19,13 +19,21 @@ import httpx
 import typer
 from aws_bedrock_token_generator import provide_token  # pyright: ignore[reportMissingImports]
 from openai import AsyncOpenAI, OpenAI  # pyright: ignore[reportMissingImports]
+from openai import (
+    AuthenticationError,
+    BadRequestError,
+    PermissionDeniedError,
+    RateLimitError,
+)  # pyright: ignore[reportMissingImports]
 
 from rich.console import Console
 from rich.json import JSON
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.status import Status
-from rich.syntax import Syntax
+from rich.text import Text
+
+__version__ = "0.1.2"
 
 MAX_CHARS = 12000
 DEFAULT_MODEL = "moonshotai.kimi-k2.5"
@@ -54,6 +62,23 @@ Use `webfetch` to fetch web pages over HTTP/HTTPS. Useful for getting up-to-date
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
+
+
+@app.callback(invoke_without_command=True)
+def main_callback(
+    ctx: typer.Context,
+    version: bool = typer.Option(
+        False, "--version", "-v", help="Show version and exit."
+    ),
+) -> None:
+    """oy - tiny local coding assistant."""
+    if version:
+        typer.echo(f"oy {__version__}")
+        raise typer.Exit()
+    if ctx.invoked_subcommand is None:
+        typer.echo(ctx.get_help())
+
+
 console = Console(stderr=True, highlight=False, soft_wrap=True)
 output_console = Console(highlight=False, soft_wrap=True)
 
@@ -127,7 +152,7 @@ def parse_tool_arguments(args_str: str) -> dict[str, Any]:
             if args_str[i] == "{":
                 try:
                     return decode(args_str[i:])
-                except (json.JSONDecodeError, ValueError):
+                except json.JSONDecodeError, ValueError:
                     pass
 
         raise exc
@@ -189,13 +214,14 @@ def clip(text: str, limit: int = MAX_CHARS) -> str:
 
 
 def print_preview(text: str, lines: int = 2) -> None:
-    """Print short preview of output."""
+    """Print short preview of output using terminal width."""
     if not text:
         return
+    width = min(console.width - 6, 120)  # Leave room for prefix, cap at 120
     preview_lines = text.splitlines()[:lines]
     for line in preview_lines:
-        # Truncate to 100 chars for denser display
-        console.print(f"  [bright_black]│[/] [dim]{line[:100]}[/]")
+        truncated = line[:width] if len(line) > width else line
+        console.print(f"  [bright_black]│[/] [dim]{truncated}[/]")
 
 
 def rel(root: Path, path: Path) -> str:
@@ -360,17 +386,6 @@ def get_openai_client(async_: bool = False) -> OpenAI | AsyncOpenAI:
         api_key=str(os.environ["OPENAI_API_KEY"]),
         base_url=os.environ.get("OPENAI_BASE_URL"),
         max_retries=3,
-    )
-
-
-def get_api_client() -> httpx.AsyncClient:
-    ensure_api_env()
-    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    return httpx.AsyncClient(
-        base_url=base_url,
-        headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
-        timeout=60.0,
-        follow_redirects=True,
     )
 
 
@@ -567,8 +582,19 @@ def tool_bash(deps: AgentDeps, command: str, timeout_seconds: int = 120) -> str:
         render_tool_details(command=command, timeout=timeout_seconds),
     )
     result = run(["bash", "-lc", command], cwd=deps.root, timeout=timeout_seconds)
+    # Show exit code prominently
+    style = "green" if result.returncode == 0 else "red"
+    console.print(f"  [dim]exit[/] [{style}]{result.returncode}[/]")
+    # Show output preview (stdout + stderr)
+    output_parts = []
+    if result.stdout.strip():
+        output_parts.append(result.stdout.strip())
+    if result.stderr.strip():
+        output_parts.append(result.stderr.strip())
+    output_text = "\n".join(output_parts)
+    if output_text:
+        print_preview(output_text, lines=3)
     output = f"exit_code: {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}".strip()
-    print_preview(output, lines=3)
     return clip(output)
 
 
@@ -645,17 +671,13 @@ def note_tool_call(deps: AgentDeps, name: str, details: str = "") -> None:
     deps.tool_calls += 1
     # Denser format: highlight tool name, dim details
     if name == "bash" and details.startswith("cmd="):
-        # Special handling for bash commands with syntax highlighting
+        # Special handling for bash commands - show command prominently
         cmd = details[4:]  # Remove "cmd=" prefix
+        console.print(f"[bright_black]>[/] [bold]{name}[/]", highlight=False)
         if sys.stderr.isatty() and cmd:
-            # Show with syntax highlighting, compact single line style
-            console.print(f"[bright_black]>[/] [bold]{name}[/]", highlight=False)
-            syntax = Syntax(cmd, "bash", theme="native", word_wrap=True)
-            console.print(syntax)
-        else:
-            console.print(
-                f"[bright_black]>[/] [bold]{name}[/] [dim]{cmd}[/]", highlight=False
-            )
+            # Use simple text with bash highlighting color
+            text = Text(cmd, style="cyan")
+            console.print(text)
     elif details:
         console.print(
             f"[bright_black]>[/] [bold]{name}[/] [dim]{details}[/]", highlight=False
@@ -825,35 +847,37 @@ async def run_agent(
     else:
         console.print(f"[dim]→[/] {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
 
-    async def agent_loop(client: httpx.AsyncClient) -> tuple[int, str]:
+    async def agent_loop(client: AsyncOpenAI) -> tuple[int, str]:
         """Single agent loop - reused for retries."""
         step = 0
         while step < max_steps:
             step += 1
 
-            request_body = {
-                "model": model,
-                "messages": messages,
-                "tools": TOOL_SCHEMAS,
-                "tool_choice": "auto",
-            }
-
             with Spinner("waiting for model"):
-                response = await client.post("/chat/completions", json=request_body)
-                response.raise_for_status()
-                data = response.json()
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,  # type: ignore[arg-type]
+                    tools=TOOL_SCHEMAS,  # type: ignore[arg-type]
+                    tool_choice="auto",
+                )
 
+            # Convert SDK response to mutable dict
+            message = response.choices[0].message.model_dump(exclude_none=True)
             if debug:
-                debug_request_response(request_body, data)
-
-            choice = data["choices"][0]
-            message = choice["message"]
+                debug_request_response(
+                    {
+                        "model": model,
+                        "messages": messages,
+                        "tools": TOOL_SCHEMAS,
+                        "tool_choice": "auto",
+                    },
+                    {"choices": [{"message": message}]},
+                )
 
             if "tool_calls" in message and message["tool_calls"]:
-                messages.append(message)
-
+                # Sanitize tool arguments before appending to prevent context pollution
                 for tool_call in message["tool_calls"]:
-                    if tool_call["type"] != "function":
+                    if tool_call.get("type") != "function":
                         continue
 
                     function = tool_call["function"]
@@ -862,8 +886,22 @@ async def run_agent(
                     tool_args = parse_tool_arguments(args_str)
                     function["arguments"] = json.dumps(tool_args)
 
+                # Now append the sanitized message
+                messages.append(message)
+
+                # Execute tools
+                for tool_call in message["tool_calls"]:
+                    if tool_call.get("type") != "function":
+                        continue
+
+                    function = tool_call["function"]
+                    tool_name = function["name"]
+                    tool_args = parse_tool_arguments(function["arguments"])
+
                     # Strip 'tool_' prefix if present for lookup
-                    lookup_name = tool_name[5:] if tool_name.startswith("tool_") else tool_name
+                    lookup_name = (
+                        tool_name[5:] if tool_name.startswith("tool_") else tool_name
+                    )
                     if lookup_name not in TOOLS:
                         result = f"Error: Unknown tool '{tool_name}'"
                     else:
@@ -871,9 +909,14 @@ async def run_agent(
                             result = TOOLS[lookup_name](deps, **tool_args)
                         except Exception as e:
                             import traceback
+
                             tb_lines = traceback.format_exc().splitlines()
                             # Show last 3 lines of traceback for context
-                            tb_preview = "\n".join(tb_lines[-3:]) if len(tb_lines) > 3 else "\n".join(tb_lines)
+                            tb_preview = (
+                                "\n".join(tb_lines[-3:])
+                                if len(tb_lines) > 3
+                                else "\n".join(tb_lines)
+                            )
                             result = f"Error in {tool_name}: {type(e).__name__}: {e}\n{tb_preview}"
 
                     messages.append(
@@ -893,33 +936,42 @@ async def run_agent(
         return fail(f"reached max steps ({max_steps}) without a final response"), ""
 
     try:
-        async with get_api_client() as client:
-            return await agent_loop(client)
-    except httpx.HTTPStatusError as exc:
+        client = get_openai_client(async_=True)
+        return await agent_loop(client)
+    except AuthenticationError:
         # Retry once on auth failure if using Bedrock (token may have expired)
-        if exc.response.status_code in (401, 403) and refresh_bedrock_token():
+        if refresh_bedrock_token():
             console.print("[dim]Bedrock token expired, refreshing...[/]")
             try:
-                async with get_api_client() as client:
-                    return await agent_loop(client)
-            except httpx.HTTPStatusError as retry_exc:
-                exc = retry_exc
+                client = get_openai_client(async_=True)
+                return await agent_loop(client)
+            except (AuthenticationError, PermissionDeniedError) as retry_exc:
+                exc = retry_exc  # type: ignore[assignment]
             except Exception as retry_exc:
                 return fail(str(retry_exc)), ""
-        error_body = exc.response.text
-        try:
-            error_json = exc.response.json()
-            error_body = json.dumps(error_json, indent=2)
-        except Exception:
-            pass
-        return fail(f"API error {exc.response.status_code}: {error_body}"), ""
+        return fail(f"API authentication error: {exc}"), ""
+    except PermissionDeniedError:
+        if refresh_bedrock_token():
+            console.print("[dim]Bedrock token expired, refreshing...[/]")
+            try:
+                client = get_openai_client(async_=True)
+                return await agent_loop(client)
+            except (AuthenticationError, PermissionDeniedError) as retry_exc:
+                exc = retry_exc  # type: ignore[assignment]
+            except Exception as retry_exc:
+                return fail(str(retry_exc)), ""
+        return fail(f"API permission denied: {exc}"), ""
+    except RateLimitError as exc:
+        return fail(f"API rate limit: {exc}"), ""
+    except BadRequestError as exc:
+        return fail(f"API bad request: {exc}"), ""
     except Exception as exc:  # noqa: BLE001
         return fail(str(exc)), ""
 
 
 @app.command("run")
 def run_command(
-    prompt: str | None = typer.Argument(
+    prompt: list[str] = typer.Argument(
         None, help="Task for the assistant. Reads stdin if omitted."
     ),
     model: str | None = typer.Option(
@@ -938,7 +990,11 @@ def run_command(
     debug: bool = typer.Option(False, help="Print raw request/response for debugging."),
 ) -> None:
     require_runtime()
-    task = prompt or (sys.stdin.read().strip() if not sys.stdin.isatty() else "")
+    task = (
+        " ".join(prompt)
+        if prompt
+        else (sys.stdin.read().strip() if not sys.stdin.isatty() else "")
+    )
     if not task:
         abort("provide a prompt argument or pipe one on stdin")
     workspace = root.resolve()
@@ -995,7 +1051,16 @@ def model_command(
 
 def main(argv: list[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
-    commands = {"run", "bedrock-token", "models", "model", "-h", "--help"}
+    commands = {
+        "run",
+        "bedrock-token",
+        "models",
+        "model",
+        "-h",
+        "--help",
+        "-v",
+        "--version",
+    }
     if not args:
         args = ["run"] if not sys.stdin.isatty() else ["--help"]
     elif args[0] not in commands:
