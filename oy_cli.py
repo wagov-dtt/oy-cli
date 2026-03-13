@@ -65,7 +65,7 @@ class Spinner:
 
     def __enter__(self) -> None:
         if not sys.stderr.isatty():
-            console.print(f"[bright_black]▸[/] {self.label}")
+            console.print(f"[bright_black]>[/] {self.label}")
             return
         self.status = console.status(f"[dim]{self.label}[/]", spinner="dots")
         self.status.__enter__()
@@ -87,39 +87,28 @@ def render_preview(value: Any, limit: int = 72) -> str:
 
 
 def render_tool_details(**details: Any) -> str:
-    # Shorten common keys for denser output
-    key_shortcuts = {
-        "path": "p",
-        "pattern": "pat",
-        "command": "cmd",
-        "timeout": "t",
-        "offset": "off",
-        "limit": "lim",
-        "chars": "c",
-        "old_chars": "old",
-        "new_chars": "new",
-        "replace_all": "all",
-        "file_glob": "glob",
-        "max_chars": "max",
-        "url": "url",
-        "n": "n",
-    }
+    """Render tool call details as compact output."""
     parts = []
     for key, value in details.items():
         if value is None or value == "":
             continue
-        k = key_shortcuts.get(key, key)
         # For booleans, just show key if true
         if isinstance(value, bool):
             if value:
-                parts.append(k)
+                parts.append(key)
         else:
             preview = render_preview(value, limit=50)
-            parts.append(f"{k}={preview}")
+            parts.append(f"{key}={preview}")
     return " ".join(parts)
 
 
 def parse_tool_arguments(args_str: str) -> dict[str, Any]:
+    """Parse tool arguments from LLM output.
+
+    Some LLMs occasionally emit duplicated JSON arguments (e.g., the same object twice).
+    This workaround hunts for valid JSON around the midpoint of malformed responses.
+    """
+
     def decode(candidate: str) -> dict[str, Any]:
         parsed = json.loads(candidate)
         parsed = json.loads(parsed) if isinstance(parsed, str) else parsed
@@ -130,18 +119,17 @@ def parse_tool_arguments(args_str: str) -> dict[str, Any]:
     try:
         return decode(args_str)
     except (json.JSONDecodeError, ValueError) as exc:
-        # Hack around duplicated return values some llms do
+        # Workaround for LLMs that duplicate the JSON in tool call arguments
         mid = len(args_str) // 2
 
-        # Hunt specifically for '{' in a generous window around the midpoint
+        # Hunt for '{' in a window around the midpoint
         for i in range(max(0, mid - 15), min(len(args_str), mid + 15)):
             if args_str[i] == "{":
                 try:
                     return decode(args_str[i:])
-                except json.JSONDecodeError, ValueError:
+                except (json.JSONDecodeError, ValueError):
                     pass
 
-        # If no valid JSON is found starting with those brackets, raise the original error
         raise exc
 
 
@@ -160,10 +148,10 @@ def print_event(
                 )
             )
         else:
-            console.print(f"▸ {label}")
+            console.print(f"> {label}")
             console.print(json.dumps(value, indent=2, ensure_ascii=True))
     else:
-        text = f"[bold cyan]▸[/] {label}"
+        text = f"[bold cyan]>[/] {label}"
         if value:
             text += f" [bold]{value}[/]"
         console.print(text)
@@ -450,6 +438,11 @@ def generate_bedrock_token(region: str) -> str:
 
 
 def resolve_path(root: Path, raw: str) -> Path:
+    """Resolve a path relative to root, preventing directory traversal.
+
+    If the resolved path would escape root, returns root/basename instead.
+    This is a security measure to prevent reading/writing outside the workspace.
+    """
     path = (root / raw).resolve()
     if path != root and root not in path.parents:
         return root / Path(raw).name
@@ -656,19 +649,19 @@ def note_tool_call(deps: AgentDeps, name: str, details: str = "") -> None:
         cmd = details[4:]  # Remove "cmd=" prefix
         if sys.stderr.isatty() and cmd:
             # Show with syntax highlighting, compact single line style
-            console.print(f"[bright_black]▸[/] [bold]{name}[/]", highlight=False)
+            console.print(f"[bright_black]>[/] [bold]{name}[/]", highlight=False)
             syntax = Syntax(cmd, "bash", theme="native", word_wrap=True)
             console.print(syntax)
         else:
             console.print(
-                f"[bright_black]▸[/] [bold]{name}[/] [dim]{cmd}[/]", highlight=False
+                f"[bright_black]>[/] [bold]{name}[/] [dim]{cmd}[/]", highlight=False
             )
     elif details:
         console.print(
-            f"[bright_black]▸[/] [bold]{name}[/] [dim]{details}[/]", highlight=False
+            f"[bright_black]>[/] [bold]{name}[/] [dim]{details}[/]", highlight=False
         )
     else:
-        console.print(f"[bright_black]▸[/] [bold]{name}[/]", highlight=False)
+        console.print(f"[bright_black]>[/] [bold]{name}[/]", highlight=False)
 
 
 def _format_size(size: int) -> str:
@@ -789,7 +782,9 @@ async def run_agent(
         console.print("[dim]User Prompt:[/dim]")
         console.print(Panel(prompt, title="User", border_style="blue", padding=(0, 1)))
 
-    def debug_request_response(request_body: dict[str, Any], data: dict[str, Any]) -> None:
+    def debug_request_response(
+        request_body: dict[str, Any], data: dict[str, Any]
+    ) -> None:
         console.print("[dim]Request JSON:[/dim]")
         console.print_json(json.dumps(request_body))
         console.print("[dim]Response JSON:[/dim]")
@@ -867,13 +862,19 @@ async def run_agent(
                     tool_args = parse_tool_arguments(args_str)
                     function["arguments"] = json.dumps(tool_args)
 
-                    if tool_name not in TOOLS:
+                    # Strip 'tool_' prefix if present for lookup
+                    lookup_name = tool_name[5:] if tool_name.startswith("tool_") else tool_name
+                    if lookup_name not in TOOLS:
                         result = f"Error: Unknown tool '{tool_name}'"
                     else:
                         try:
-                            result = TOOLS[tool_name](deps, **tool_args)
+                            result = TOOLS[lookup_name](deps, **tool_args)
                         except Exception as e:
-                            result = f"Error: {e}"
+                            import traceback
+                            tb_lines = traceback.format_exc().splitlines()
+                            # Show last 3 lines of traceback for context
+                            tb_preview = "\n".join(tb_lines[-3:]) if len(tb_lines) > 3 else "\n".join(tb_lines)
+                            result = f"Error in {tool_name}: {type(e).__name__}: {e}\n{tb_preview}"
 
                     messages.append(
                         {

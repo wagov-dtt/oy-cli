@@ -1,51 +1,27 @@
 # oy-cli
 
-Tiny local coding CLI for simple shell interactive code editing and auditing.
-
-## Quick Start
+**Tiny AI coding assistant for your shell.** Reads files, runs commands, makes edits - nothing fancy.
 
 ```bash
 uv tool install oy-cli
-oy "summarize this project and suggest next changes"
+oy "add type hints to the main function"
 ```
 
-The point is to keep the tool surface boring, explicit, and easy to audit (most existing tools and agents are large/complex or locked to specific providers).
+## Why This Exists
 
-## Design
+Most AI coding tools are large, complex, or lock you into specific providers. `oy` is ~1000 lines of straightforward Python with a minimal tool surface. Easy to audit, easy to understand, easy to run safely.
 
-- follow OWASP-minded secure defaults
-- prefer the grugbrain.dev philosophy: simple, direct, low-magic solutions
-- run inside a locked-down container with limited filesystem, process, and network permissions if you want to use it safely
-- de-scope advanced surfaces like todos, skills, and MCPs (bash is fine, most tools have good CLI interfaces)
+## Tools
 
-## Tool Surface
-
-Initial tools:
-
-- `write`: create new files with `pathlib`
-- `edit`: modify existing files with `pathlib` read/write
-- `patch`: apply unified diffs with `patch` (via subprocess)
-- `list`: list directory contents with `pathlib`
-- `read`: read files with `pathlib`
-- `grep`: search text with `subprocess` + `ripgrep`
-- `glob`: find files and directories with `pathlib.glob`
-- `bash`: run shell commands with `subprocess` via `bash -lc` as a last resort
-- `webfetch`: fetch web content with `httpx`
-
-That is enough for useful local coding work and security audits.
-
-## Known Issues
-
-Some LLMs occasionally emit duplicated tool call arguments. `oy` includes a workaround that detects and recovers from this by hunting for valid JSON around the midpoint of the malformed response.
+File operations: `read` `write` `edit` `patch` `list` `glob` `grep`  
+Shell: `bash` (for builds, tests, git)  
+Network: `webfetch` (for docs, API lookups)
 
 ## Requirements
 
 - Python 3.14+
-- `bash`
-- `patch`
-- `OPENAI_API_KEY` in the environment, OR AWS credentials for automatic Bedrock setup
-
-`ripgrep` is included as a PyPI dependency. If AWS credentials are available (via `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, or `~/.aws/credentials`), `oy` will automatically generate Bedrock tokens. If `bash`, `rg`, or `patch` are missing, `oy` exits with install guidance instead of silently falling back.
+- `bash`, `patch`, `rg` (ripgrep)
+- OpenAI API key OR AWS credentials (for Bedrock)
 
 ## Installation
 
