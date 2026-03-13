@@ -48,15 +48,7 @@ Work simply and directly. Follow OWASP-minded secure defaults: least privilege, 
 
 Be concise. Keep responses to one or two CLI screens. Inspect before changing. Use the smallest change that works.
 
-NEVER use bash for file operations. Use workspace tools instead:
-
-  - `list` → directory listings (not `ls`)
-  - `glob` → find files by pattern (not `find`)
-  - `grep` → search file contents (not `grep`/`rg`)
-  - `read` → read file contents (not `cat`/`head`/`tail`)
-  - `history` → prior conversation context
-
-Use `bash` ONLY for: builds, tests, package managers, git, or system commands.
+Use workspace tools (read/edit/grep/list/glob) for file operations. Reserve `bash` for builds, tests, git, and system commands only. See tool descriptions for specifics.
 
 Use `webfetch` to fetch web pages over HTTP/HTTPS. Useful for getting up-to-date documentation, checking library references, or verifying current API details. Automatically follows redirects and truncates large responses.
 """
@@ -144,20 +136,30 @@ def parse_tool_arguments(args_str: str) -> dict[str, Any]:
 
         # Hunt specifically for '{' in a generous window around the midpoint
         for i in range(max(0, mid - 15), min(len(args_str), mid + 15)):
-            if args_str[i] == '{':
+            if args_str[i] == "{":
                 try:
                     return decode(args_str[i:])
-                except (json.JSONDecodeError, ValueError):
+                except json.JSONDecodeError, ValueError:
                     pass
 
         # If no valid JSON is found starting with those brackets, raise the original error
         raise exc
 
-def print_event(label: str, value: str | dict[str, Any] | None = None, border_style: str = "yellow") -> None:
+
+def print_event(
+    label: str, value: str | dict[str, Any] | None = None, border_style: str = "yellow"
+) -> None:
     """Print a status event. If value is a dict, shows as JSON panel; otherwise as text."""
     if isinstance(value, dict):
         if sys.stderr.isatty():
-            console.print(Panel.fit(JSON.from_data(value), title=label, border_style=border_style, padding=(0, 1)))
+            console.print(
+                Panel.fit(
+                    JSON.from_data(value),
+                    title=label,
+                    border_style=border_style,
+                    padding=(0, 1),
+                )
+            )
         else:
             console.print(f"▸ {label}")
             console.print(json.dumps(value, indent=2, ensure_ascii=True))
@@ -495,40 +497,42 @@ def edit_tool(
         raise ValueError("old_text not found")
     if count > 1 and not replace_all:
         raise ValueError("old_text matched multiple locations; set replace_all=true")
-    
+
     if replace_all:
         # Replace all occurrences directly
         target.write_text(text.replace(old_text, new_text), encoding="utf-8")
         result = f"edited {rel(root, target)} ({count} replacement{'s' if count != 1 else ''})"
         print_preview(result, lines=1)
         return result
-    
+
     # Build a unified diff for the first occurrence and apply with fuzzy matching
     import difflib
-    
+
     idx = text.find(old_text)
     # Get text before and after the change
     before = text[:idx]
-    after = text[idx + len(old_text):]
+    after = text[idx + len(old_text) :]
     new_content = before + new_text + after
-    
+
     # Generate unified diff
     fromfile = f"a/{path}"
     tofile = f"b/{path}"
-    diff_lines = list(difflib.unified_diff(
-        text.splitlines(keepends=True),
-        new_content.splitlines(keepends=True),
-        fromfile=fromfile,
-        tofile=tofile,
-        lineterm='\n',
-    ))
+    diff_lines = list(
+        difflib.unified_diff(
+            text.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile=fromfile,
+            tofile=tofile,
+            lineterm="\n",
+        )
+    )
     patch_text = "".join(diff_lines)
     if not patch_text:
         # No changes needed
         result = f"edited {rel(root, target)} (no changes)"
         print_preview(result, lines=1)
         return result
-    
+
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
         handle.write(patch_text)
         patch_file = handle.name
@@ -548,10 +552,10 @@ def edit_tool(
         )
     finally:
         Path(patch_file).unlink(missing_ok=True)
-    
+
     if result_proc.returncode != 0:
         raise ValueError(clip(f"patch failed: {result_proc.stderr.strip()}"))
-    
+
     result = f"edited {rel(root, target)} (1 replacement)"
     print_preview(result, lines=1)
     return result
@@ -658,9 +662,13 @@ def note_tool_call(deps: AgentDeps, name: str, details: str = "") -> None:
             syntax = Syntax(cmd, "bash", theme="native", word_wrap=True)
             console.print(syntax)
         else:
-            console.print(f"[bright_black]▸[/] [bold]{name}[/] [dim]{cmd}[/]", highlight=False)
+            console.print(
+                f"[bright_black]▸[/] [bold]{name}[/] [dim]{cmd}[/]", highlight=False
+            )
     elif details:
-        console.print(f"[bright_black]▸[/] [bold]{name}[/] [dim]{details}[/]", highlight=False)
+        console.print(
+            f"[bright_black]▸[/] [bold]{name}[/] [dim]{details}[/]", highlight=False
+        )
     else:
         console.print(f"[bright_black]▸[/] [bold]{name}[/]", highlight=False)
 
@@ -765,7 +773,7 @@ def tool_history(deps: AgentDeps, n: int = 3) -> str:
     # Handle n that might come as string from LLM
     try:
         n = int(n) if n is not None else 3
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         n = 3
     note_tool_call(deps, "history", render_tool_details(n=n))
     entries = load_history(deps.root)
@@ -812,14 +820,14 @@ def _schema_from_func(name: str, func: callable) -> dict[str, Any]:
     sig = inspect.signature(func)
     doc = inspect.getdoc(func) or ""
     description = doc.split("\n\n")[0].strip() if doc else ""
-    
+
     properties: dict[str, Any] = {}
     required: list[str] = []
-    
+
     for pname, param in sig.parameters.items():
         if pname == "deps":
             continue
-        
+
         annotation = param.annotation
         if annotation is str:
             ptype = "string"
@@ -831,11 +839,11 @@ def _schema_from_func(name: str, func: callable) -> dict[str, Any]:
             ptype = "number"
         else:
             ptype = "string"
-        
+
         properties[pname] = {"type": ptype}
         if param.default is inspect.Parameter.empty:
             required.append(pname)
-    
+
     schema: dict[str, Any] = {
         "type": "function",
         "function": {
@@ -884,13 +892,13 @@ async def run_agent(
         )
         console.print(f"[dim]Model:[/dim] {model}")
         console.print("[dim]System Prompt:[/dim]")
-        console.print(Panel(system_prompt, title="System", border_style="dim", padding=(0, 1)))
+        console.print(
+            Panel(system_prompt, title="System", border_style="dim", padding=(0, 1))
+        )
         console.print("[dim]User Prompt:[/dim]")
         console.print(Panel(prompt, title="User", border_style="blue", padding=(0, 1)))
     else:
-        console.print(
-            f"[dim]→[/] {prompt[:100]}{'...' if len(prompt) > 100 else ''}"
-        )
+        console.print(f"[dim]→[/] {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
 
     async def agent_loop(client: httpx.AsyncClient) -> tuple[int, str]:
         """Single agent loop - reused for retries."""
@@ -920,23 +928,31 @@ async def run_agent(
                 role = last_msg.get("role", "unknown")
                 content = last_msg.get("content", "") or ""
                 tool_calls = last_msg.get("tool_calls")
-                console.print(f"[dim]Request ({role}):[/dim] {content[:200]}{'...' if len(content) > 200 else ''}")
+                console.print(
+                    f"[dim]Request ({role}):[/dim] {content[:200]}{'...' if len(content) > 200 else ''}"
+                )
                 if tool_calls:
                     for tc in tool_calls:
                         if tc.get("type") == "function":
                             fn = tc["function"]
-                            console.print(f"[dim]  → {fn.get('name')}:[/dim] {str(fn.get('arguments', ''))[:100]}{'...' if len(str(fn.get('arguments', ''))) > 100 else ''}")
+                            console.print(
+                                f"[dim]  → {fn.get('name')}:[/dim] {str(fn.get('arguments', ''))[:100]}{'...' if len(str(fn.get('arguments', ''))) > 100 else ''}"
+                            )
 
                 choice_msg = data["choices"][0]["message"]
                 resp_content = choice_msg.get("content", "") or ""
                 resp_tool_calls = choice_msg.get("tool_calls")
                 if resp_content:
-                    console.print(f"[dim]Response:[/dim] {resp_content[:200]}{'...' if len(resp_content) > 200 else ''}")
+                    console.print(
+                        f"[dim]Response:[/dim] {resp_content[:200]}{'...' if len(resp_content) > 200 else ''}"
+                    )
                 if resp_tool_calls:
                     for tc in resp_tool_calls:
                         if tc.get("type") == "function":
                             fn = tc["function"]
-                            console.print(f"[dim]  → {fn.get('name')}:[/dim] {str(fn.get('arguments', ''))[:100]}{'...' if len(str(fn.get('arguments', ''))) > 100 else ''}")
+                            console.print(
+                                f"[dim]  → {fn.get('name')}:[/dim] {str(fn.get('arguments', ''))[:100]}{'...' if len(str(fn.get('arguments', ''))) > 100 else ''}"
+                            )
 
             choice = data["choices"][0]
             message = choice["message"]
@@ -962,11 +978,13 @@ async def run_agent(
                         except Exception as e:
                             result = f"Error: {e}"
 
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "content": str(result),
-                    })
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "content": str(result),
+                        }
+                    )
             else:
                 output = message["content"] or ""
                 render_agent_output(output)
