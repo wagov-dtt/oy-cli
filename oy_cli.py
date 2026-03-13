@@ -152,7 +152,7 @@ def parse_tool_arguments(args_str: str) -> dict[str, Any]:
             if args_str[i] == "{":
                 try:
                     return decode(args_str[i:])
-                except json.JSONDecodeError, ValueError:
+                except (json.JSONDecodeError, ValueError):
                     pass
 
         raise exc
@@ -247,7 +247,7 @@ def config_path() -> Path:
 def load_json(path: Path, default: Any) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except OSError, json.JSONDecodeError:
+    except (OSError, json.JSONDecodeError):
         return default
 
 
@@ -938,29 +938,19 @@ async def run_agent(
     try:
         client = get_openai_client(async_=True)
         return await agent_loop(client)
-    except AuthenticationError:
-        # Retry once on auth failure if using Bedrock (token may have expired)
+    except (AuthenticationError, PermissionDeniedError) as exc:
+        # Retry once on auth/permission failure if using Bedrock (token may have expired)
         if refresh_bedrock_token():
             console.print("[dim]Bedrock token expired, refreshing...[/]")
             try:
                 client = get_openai_client(async_=True)
                 return await agent_loop(client)
             except (AuthenticationError, PermissionDeniedError) as retry_exc:
-                exc = retry_exc  # type: ignore[assignment]
+                return fail(f"API {type(retry_exc).__name__}: {retry_exc}"), ""
             except Exception as retry_exc:
                 return fail(str(retry_exc)), ""
-        return fail(f"API authentication error: {exc}"), ""
-    except PermissionDeniedError:
-        if refresh_bedrock_token():
-            console.print("[dim]Bedrock token expired, refreshing...[/]")
-            try:
-                client = get_openai_client(async_=True)
-                return await agent_loop(client)
-            except (AuthenticationError, PermissionDeniedError) as retry_exc:
-                exc = retry_exc  # type: ignore[assignment]
-            except Exception as retry_exc:
-                return fail(str(retry_exc)), ""
-        return fail(f"API permission denied: {exc}"), ""
+        error_type = "authentication" if isinstance(exc, AuthenticationError) else "permission"
+        return fail(f"API {error_type} error: {exc}"), ""
     except RateLimitError as exc:
         return fail(f"API rate limit: {exc}"), ""
     except BadRequestError as exc:
