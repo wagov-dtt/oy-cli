@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oy-cli"
+version = "0.1.0"
+description = "Tiny local coding CLI with a small tool surface"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "Apache-2.0"
+authors = [{ name = "oy-cli contributors" }]
+dependencies = [
+  "aws-bedrock-token-generator>=1.1.0",
+  "diskcache>=5.6.0",
+  "httpx>=0.28.1",
+  "pydantic-ai-slim[openai]>=1.68.0",
+  "rich>=14.1.0",
+  "ripgrep>=15.0.0",
+  "typer>=0.16.0",
+]
+
+[dependency-groups]
+dev = [
+  "ruff>=0.11.0",
+]
+
+[project.scripts]
+oy = "oy_cli:main"
+
+[tool.uv]
+default-groups = ["dev"]

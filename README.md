@@ -7,7 +7,7 @@ Tiny local coding CLI for simple shell interactive code editing and auditing.
 - one-shot Typer CLI, not a full TUI
 - decent progress output, not advanced orchestration
 - one main code file as the implementation target
-- overall code size target under 500 lines
+- intentionally small and auditable
 
 The point is to keep the tool surface boring, explicit, and easy to audit (most existing tools and agents are large/complex or locked to specific providers).
 
@@ -25,22 +25,27 @@ Initial tools:
 - `write`: create new files with `pathlib`
 - `edit`: modify existing files with `pathlib` read/write
 - `patch`: apply unified diffs with `patch` (via subprocess)
-- `bash`: run shell commands with `subprocess` via `bash -lc`
+- `list`: list directory contents with `pathlib`
 - `read`: read files with `pathlib`
 - `grep`: search text with `subprocess` + `ripgrep`
 - `glob`: find files and directories with `pathlib.glob`
+- `bash`: run shell commands with `subprocess` via `bash -lc` as a last resort
 - `webfetch`: fetch web content with `httpx`
 
 That is enough for useful local coding work and security audits.
+
+## Known Issues
+
+Some LLMs occasionally emit duplicated tool call arguments. `oy` includes a workaround that detects and recovers from this by hunting for valid JSON around the midpoint of the malformed response.
 
 ## Requirements
 
 - Python 3.14+
 - `bash`
 - `patch`
-- `OPENAI_API_KEY` and `OPENAI_BASE_URL` in the environment
+- `OPENAI_API_KEY` in the environment, OR AWS credentials for automatic Bedrock setup
 
-`ripgrep` is included as a PyPI dependency. `oy bedrock-token` can also use the AWS CLI as a fallback to recover authentication if token generation fails. If `bash`, `rg`, or `patch` are missing, `oy` exits with install guidance instead of silently falling back.
+`ripgrep` is included as a PyPI dependency. If AWS credentials are available (via `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, or `~/.aws/credentials`), `oy` will automatically generate Bedrock tokens. If `bash`, `rg`, or `patch` are missing, `oy` exits with install guidance instead of silently falling back.
 
 ## Installation
 
@@ -58,17 +63,25 @@ pip install oy-cli
 
 This installs the `oy` command.
 
-## Quick Start using AWS Bedrock
+## Quick Start using AWS Bedrock (automatic)
+
+If you have AWS credentials configured (via `AWS_PROFILE`, environment variables, or `~/.aws/credentials`), Bedrock is automatically configured:
 
 ```bash
-eval "$(oy bedrock-token)"
-oy select-model
+oy models
+oy model moonshotai.kimi-k2.5
 oy "inspect this repository and suggest the smallest safe fix"
 ```
 
-`oy list-models` and `oy select-model` use the OpenAI SDK with `client.models.list()` and can save the chosen model in local settings.
+To manually export Bedrock tokens (for use in other tools or scripts):
 
-With manual creds:
+```bash
+eval "$(oy bedrock-token)"
+```
+
+`oy models` uses the OpenAI SDK with `client.models.list()`. `oy model <id>` saves your default model.
+
+With OpenAI-compatible manual creds:
 
 ```bash
 export OPENAI_BASE_URL=https://your-endpoint.example/v1
@@ -76,22 +89,29 @@ export OPENAI_API_KEY=...
 oy "summarize this project and list the next changes"
 ```
 
+With OpenAI's default API endpoint:
+
+```bash
+export OPENAI_API_KEY=...
+oy "summarize this project and list the next changes"
+```
+
 ## Runtime Behavior
 
 - simple CLI flow, no REPL and no TUI
-- Typer-based CLI with a small `settings` surface
+- simple commands: `oy "..."`, `oy bedrock-token`, `oy models`, `oy model <id>`
 - model chooses from a small set of local tools
 - file operations are scoped to the working directory
 - required tools are checked up front
 - indeterminate progress is shown while waiting on API calls
 - default model/tool budgets are intentionally high for longer build-style runs
 
-## Settings
+## Model Selection
 
 ```bash
-oy settings show
-oy settings set model moonshotai.kimi-k2.5
-oy settings get model
+oy model
+oy models
+oy model moonshotai.kimi-k2.5
 ```
 
 ## Security
@@ -105,25 +125,9 @@ Recommended posture:
 - avoid broad host access
 - do not expose secrets you do not want shell commands to inherit
 
-## Development
+## Contributing
 
-`mise` manages local tooling and `uv` handles Python environments and packaging.
-
-```bash
-mise install
-uv sync
-mise run fmt
-mise run lint
-mise run check
-uv run oy --help
-mise run build
-```
-
-## Packaging
-
-- PyPI package: `oy-cli`
-- installed command: `oy`
-- intended end-user install path: `uv tool install oy-cli`
+Development and release notes live in `CONTRIBUTING.md`.
 
 ## License
 
