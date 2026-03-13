@@ -2,16 +2,16 @@
 
 Tiny local coding CLI for simple shell interactive code editing and auditing.
 
-`oy` is intentionally small:
+## Quick Start
 
-- one-shot Typer CLI, not a full TUI
-- decent progress output, not advanced orchestration
-- one main code file as the implementation target
-- intentionally small and auditable
+```bash
+uv tool install oy-cli
+oy "summarize this project and suggest next changes"
+```
 
 The point is to keep the tool surface boring, explicit, and easy to audit (most existing tools and agents are large/complex or locked to specific providers).
 
-## Design Notes
+## Design
 
 - follow OWASP-minded secure defaults
 - prefer the grugbrain.dev philosophy: simple, direct, low-magic solutions
@@ -63,55 +63,43 @@ pip install oy-cli
 
 This installs the `oy` command.
 
-## Quick Start using AWS Bedrock (automatic)
+## AWS Bedrock (automatic)
 
-If you have AWS credentials configured (via `AWS_PROFILE`, environment variables, or `~/.aws/credentials`), Bedrock is automatically configured:
+If you have AWS credentials configured, Bedrock is auto-configured:
 
 ```bash
 oy models
 oy model moonshotai.kimi-k2.5
-oy "inspect this repository and suggest the smallest safe fix"
 ```
 
-To manually export Bedrock tokens (for use in other tools or scripts):
+To export Bedrock tokens for other tools:
 
 ```bash
 eval "$(oy bedrock-token)"
 ```
 
-`oy models` uses the OpenAI SDK with `client.models.list()`. `oy model <id>` saves your default model.
+## OpenAI API
 
-With OpenAI-compatible manual creds:
+```bash
+export OPENAI_API_KEY=...
+oy "summarize this project"
+```
+
+For OpenAI-compatible endpoints:
 
 ```bash
 export OPENAI_BASE_URL=https://your-endpoint.example/v1
 export OPENAI_API_KEY=...
-oy "summarize this project and list the next changes"
 ```
 
-With OpenAI's default API endpoint:
+## Commands
 
 ```bash
-export OPENAI_API_KEY=...
-oy "summarize this project and list the next changes"
-```
-
-## Runtime Behavior
-
-- simple CLI flow, no REPL and no TUI
-- simple commands: `oy "..."`, `oy bedrock-token`, `oy models`, `oy model <id>`
-- model chooses from a small set of local tools
-- file operations are scoped to the working directory
-- required tools are checked up front
-- indeterminate progress is shown while waiting on API calls
-- default model/tool budgets are intentionally high for longer build-style runs
-
-## Model Selection
-
-```bash
-oy model
-oy models
-oy model moonshotai.kimi-k2.5
+oy "prompt"              # Run with a prompt
+oy models                # List available models
+oy model <id>            # Set default model
+oy model                 # Show current model
+oy bedrock-token         # Export Bedrock credentials
 ```
 
 ## Security

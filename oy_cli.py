@@ -248,32 +248,40 @@ def save_config(data: dict[str, str]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def history_cache() -> diskcache.Cache:
-    HISTORY_CACHE_PATH.mkdir(parents=True, exist_ok=True)
-    return diskcache.Cache(str(HISTORY_CACHE_PATH))
+class HistoryStore:
+    """Simple file history storage using diskcache."""
 
+    def __init__(self, cache_path: Path = HISTORY_CACHE_PATH) -> None:
+        self._cache_path = cache_path
+        cache_path.mkdir(parents=True, exist_ok=True)
+        self._cache = diskcache.Cache(str(cache_path))
 
-def history_key(root: Path) -> str:
-    return str(root.resolve())
+    def _key(self, root: Path) -> str:
+        return str(root.resolve())
 
+    def load(self, root: Path) -> list[dict[str, Any]]:
+        return self._cache.get(self._key(root), [])
 
-def load_history(root: Path) -> list[dict[str, Any]]:
-    with history_cache() as cache:
-        return cache.get(history_key(root), [])
-
-
-def save_history(root: Path, prompt: str, output: str) -> None:
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "prompt": prompt,
-        "output": output,
-    }
-    with history_cache() as cache:
-        key = history_key(root)
-        history = cache.get(key, [])
+    def save(self, root: Path, prompt: str, output: str) -> None:
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "prompt": prompt,
+            "output": output,
+        }
+        key = self._key(root)
+        history = self._cache.get(key, [])
         history.append(entry)
-        # Keep only last N entries
-        cache[key] = history[-MAX_HISTORY_PER_DIR:]
+        self._cache[key] = history[-MAX_HISTORY_PER_DIR:]
+
+
+_history_store: HistoryStore | None = None
+
+
+def get_history_store() -> HistoryStore:
+    global _history_store
+    if _history_store is None:
+        _history_store = HistoryStore()
+    return _history_store
 
 
 def current_model(choice: str | None) -> str:
@@ -465,7 +473,9 @@ def tool_list(deps: AgentDeps, path: str = ".", limit: int = 200) -> str:
 
 def tool_read(deps: AgentDeps, path: str, offset: int = 1, limit: int = 200) -> str:
     """Read a file in the workspace. Use this instead of `cat`, `head`, or `tail`."""
-    note_tool_call(deps, "read", render_tool_details(path=path, offset=offset, limit=limit))
+    note_tool_call(
+        deps, "read", render_tool_details(path=path, offset=offset, limit=limit)
+    )
     target = resolve_path(deps.root, path)
     if target.is_dir():
         return tool_list(deps, path, limit)
@@ -496,7 +506,7 @@ def tool_edit(
     new_text: str,
     replace_all: bool = False,
 ) -> str:
-    """Replace text in an existing workspace file using fuzzy patch matching for resilience."""
+    """Replace text in an existing workspace file."""
     note_tool_call(
         deps,
         "edit",
@@ -517,65 +527,13 @@ def tool_edit(
     if count > 1 and not replace_all:
         raise ValueError("old_text matched multiple locations; set replace_all=true")
 
-    if replace_all:
-        # Replace all occurrences directly
-        target.write_text(text.replace(old_text, new_text), encoding="utf-8")
-        result = f"edited {rel(deps.root, target)} ({count} replacement{'s' if count != 1 else ''})"
-        print_preview(result, lines=1)
-        return result
-
-    # Build a unified diff for the first occurrence and apply with fuzzy matching
-    import difflib
-
-    idx = text.find(old_text)
-    # Get text before and after the change
-    before = text[:idx]
-    after = text[idx + len(old_text) :]
-    new_content = before + new_text + after
-
-    # Generate unified diff
-    fromfile = f"a/{path}"
-    tofile = f"b/{path}"
-    diff_lines = list(
-        difflib.unified_diff(
-            text.splitlines(keepends=True),
-            new_content.splitlines(keepends=True),
-            fromfile=fromfile,
-            tofile=tofile,
-            lineterm="\n",
-        )
+    new_content = (
+        text.replace(old_text, new_text)
+        if replace_all
+        else text.replace(old_text, new_text, 1)
     )
-    patch_text = "".join(diff_lines)
-    if not patch_text:
-        # No changes needed
-        result = f"edited {rel(deps.root, target)} (no changes)"
-        print_preview(result, lines=1)
-        return result
-
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
-        handle.write(patch_text)
-        patch_file = handle.name
-    try:
-        result_proc = run(
-            [
-                "patch",
-                "--strip=1",
-                "--directory",
-                str(deps.root),
-                "--input",
-                patch_file,
-                "--forward",
-                "--batch",
-                "--fuzz=3",
-            ]
-        )
-    finally:
-        Path(patch_file).unlink(missing_ok=True)
-
-    if result_proc.returncode != 0:
-        raise ValueError(clip(f"patch failed: {result_proc.stderr.strip()}"))
-
-    result = f"edited {rel(deps.root, target)} (1 replacement)"
+    target.write_text(new_content, encoding="utf-8")
+    result = f"edited {rel(deps.root, target)} ({count} replacement{'s' if count != 1 else ''})"
     print_preview(result, lines=1)
     return result
 
@@ -726,7 +684,7 @@ def _format_size(size: int) -> str:
 def tool_history(deps: AgentDeps, n: int = 3) -> str:
     """View the last N command outputs from this workspace history."""
     note_tool_call(deps, "history", render_tool_details(n=n))
-    entries = load_history(deps.root)
+    entries = get_history_store().load(deps.root)
     if not entries:
         return "<no history>"
     lines = []
@@ -765,161 +723,33 @@ TOOLS = {
 }
 
 
-# Explicit tool schemas for OpenAI function calling
-TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {
+def tool_schema(func: Any) -> dict[str, Any]:
+    """Generate OpenAI function schema from a tool function's signature."""
+    import inspect
+
+    sig = inspect.signature(func)
+    params: dict[str, Any] = {"type": "object", "properties": {}, "required": []}
+    type_map = {str: "string", int: "integer", bool: "boolean"}
+
+    for name, param in sig.parameters.items():
+        if name == "deps":
+            continue
+        ptype = type_map.get(param.annotation, "string")
+        params["properties"][name] = {"type": ptype}
+        if param.default is inspect.Parameter.empty:
+            params["required"].append(name)
+
+    return {
         "type": "function",
         "function": {
-            "name": "write",
-            "description": "Create or overwrite a file in the workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
-                },
-                "required": ["path", "content"],
-            },
+            "name": func.__name__,
+            "description": (func.__doc__ or "").split("\n")[0],
+            "parameters": params,
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit",
-            "description": "Replace text in an existing workspace file using fuzzy patch matching for resilience.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "old_text": {"type": "string"},
-                    "new_text": {"type": "string"},
-                    "replace_all": {"type": "boolean"},
-                },
-                "required": ["path", "old_text", "new_text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "patch",
-            "description": "Apply a unified diff inside the workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "patch_text": {"type": "string"},
-                },
-                "required": ["patch_text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list",
-            "description": "List files and directories in a workspace directory. Use this instead of `bash` with `ls`.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "limit": {"type": "integer"},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": "Last resort: run shell commands for builds, tests, git, package managers, or other real terminal tasks.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "timeout_seconds": {"type": "integer"},
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read",
-            "description": "Read a file in the workspace. Use this instead of `cat`, `head`, or `tail`.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "offset": {"type": "integer"},
-                    "limit": {"type": "integer"},
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "grep",
-            "description": "Search workspace file contents with ripgrep. Use this instead of `grep` or `rg` in bash.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "path": {"type": "string"},
-                    "file_glob": {"type": "string"},
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "glob",
-            "description": "Find files or directories with glob patterns. Use this instead of `find` in bash.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "path": {"type": "string"},
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "webfetch",
-            "description": "Fetch a web page over HTTP or HTTPS. Use this to get up-to-date documentation, library references, or API details from the web. Follows redirects automatically.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string"},
-                    "max_chars": {"type": "integer"},
-                },
-                "required": ["url"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "history",
-            "description": "View the last N command outputs from this workspace history.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "n": {"type": "integer"},
-                },
-                "required": [],
-            },
-        },
-    },
-]
+    }
+
+
+TOOL_SCHEMAS: list[dict[str, Any]] = [tool_schema(func) for func in TOOLS.values()]
 
 
 def list_model_ids() -> list[str]:
@@ -946,7 +776,7 @@ async def run_agent(
         {"role": "user", "content": prompt},
     ]
 
-    if debug:
+    def debug_startup() -> None:
         console.print("[bold yellow]DEBUG MODE ENABLED[/]")
         console.print(
             f"[dim]URL:[/dim] {os.environ.get('OPENAI_BASE_URL', 'https://api.openai.com/v1')}/chat/completions"
@@ -958,6 +788,45 @@ async def run_agent(
         )
         console.print("[dim]User Prompt:[/dim]")
         console.print(Panel(prompt, title="User", border_style="blue", padding=(0, 1)))
+
+    def debug_request_response(request_body: dict[str, Any], data: dict[str, Any]) -> None:
+        console.print("[dim]Request JSON:[/dim]")
+        console.print_json(json.dumps(request_body))
+        console.print("[dim]Response JSON:[/dim]")
+        console.print_json(json.dumps(data))
+
+        last_msg = request_body["messages"][-1]
+        role = last_msg.get("role", "unknown")
+        content = last_msg.get("content", "") or ""
+        tool_calls = last_msg.get("tool_calls")
+        console.print(
+            f"[dim]Request ({role}):[/dim] {content[:200]}{'...' if len(content) > 200 else ''}"
+        )
+        if tool_calls:
+            for tc in tool_calls:
+                if tc.get("type") == "function":
+                    fn = tc["function"]
+                    console.print(
+                        f"[dim]  → {fn.get('name')}:[/dim] {str(fn.get('arguments', ''))[:100]}{'...' if len(str(fn.get('arguments', ''))) > 100 else ''}"
+                    )
+
+        choice_msg = data["choices"][0]["message"]
+        resp_content = choice_msg.get("content", "") or ""
+        resp_tool_calls = choice_msg.get("tool_calls")
+        if resp_content:
+            console.print(
+                f"[dim]Response:[/dim] {resp_content[:200]}{'...' if len(resp_content) > 200 else ''}"
+            )
+        if resp_tool_calls:
+            for tc in resp_tool_calls:
+                if tc.get("type") == "function":
+                    fn = tc["function"]
+                    console.print(
+                        f"[dim]  → {fn.get('name')}:[/dim] {str(fn.get('arguments', ''))[:100]}{'...' if len(str(fn.get('arguments', ''))) > 100 else ''}"
+                    )
+
+    if debug:
+        debug_startup()
     else:
         console.print(f"[dim]→[/] {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
 
@@ -980,40 +849,7 @@ async def run_agent(
                 data = response.json()
 
             if debug:
-                console.print("[dim]Request JSON:[/dim]")
-                console.print_json(json.dumps(request_body))
-                console.print("[dim]Response JSON:[/dim]")
-                console.print_json(json.dumps(data))
-
-                last_msg = request_body["messages"][-1]
-                role = last_msg.get("role", "unknown")
-                content = last_msg.get("content", "") or ""
-                tool_calls = last_msg.get("tool_calls")
-                console.print(
-                    f"[dim]Request ({role}):[/dim] {content[:200]}{'...' if len(content) > 200 else ''}"
-                )
-                if tool_calls:
-                    for tc in tool_calls:
-                        if tc.get("type") == "function":
-                            fn = tc["function"]
-                            console.print(
-                                f"[dim]  → {fn.get('name')}:[/dim] {str(fn.get('arguments', ''))[:100]}{'...' if len(str(fn.get('arguments', ''))) > 100 else ''}"
-                            )
-
-                choice_msg = data["choices"][0]["message"]
-                resp_content = choice_msg.get("content", "") or ""
-                resp_tool_calls = choice_msg.get("tool_calls")
-                if resp_content:
-                    console.print(
-                        f"[dim]Response:[/dim] {resp_content[:200]}{'...' if len(resp_content) > 200 else ''}"
-                    )
-                if resp_tool_calls:
-                    for tc in resp_tool_calls:
-                        if tc.get("type") == "function":
-                            fn = tc["function"]
-                            console.print(
-                                f"[dim]  → {fn.get('name')}:[/dim] {str(fn.get('arguments', ''))[:100]}{'...' if len(str(fn.get('arguments', ''))) > 100 else ''}"
-                            )
+                debug_request_response(request_body, data)
 
             choice = data["choices"][0]
             message = choice["message"]
@@ -1050,7 +886,7 @@ async def run_agent(
                 output = message["content"] or ""
                 render_agent_output(output)
                 if save_to_history:
-                    save_history(root, prompt, output)
+                    get_history_store().save(root, prompt, output)
                 return 0, output
 
         return fail(f"reached max steps ({max_steps}) without a final response"), ""
@@ -1156,47 +992,13 @@ def model_command(
     typer.echo(model)
 
 
-def _split_args_and_prompt(args: list[str]) -> tuple[list[str], list[str]]:
-    """Split args into options and prompt parts. Returns (options, prompt_parts)."""
-    options: list[str] = []
-    prompt_parts: list[str] = []
-    i = 0
-    while i < len(args):
-        arg = args[i]
-        if arg == "--":
-            # Everything after -- is prompt
-            prompt_parts.extend(args[i + 1 :])
-            break
-        if arg.startswith("-"):
-            options.append(arg)
-            # Check if this option takes a value
-            if arg in ("-m", "--model", "-r", "--root", "-s", "--system-file"):
-                if i + 1 < len(args) and not args[i + 1].startswith("-"):
-                    options.append(args[i + 1])
-                    i += 1
-            i += 1
-        else:
-            # First non-option and everything after is prompt
-            prompt_parts.extend(args[i:])
-            break
-    return options, prompt_parts
-
-
 def main(argv: list[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
     commands = {"run", "bedrock-token", "models", "model", "-h", "--help"}
     if not args:
         args = ["run"] if not sys.stdin.isatty() else ["--help"]
-    elif args[0] not in commands and args[0].startswith("-"):
-        args = ["run", *args]
     elif args[0] not in commands:
         args = ["run", *args]
-
-    # Join multiple args into a single prompt for run command
-    if args and args[0] == "run" and len(args) > 2:
-        options, prompt_parts = _split_args_and_prompt(args[1:])
-        if len(prompt_parts) > 1:
-            args = ["run"] + options + [" ".join(prompt_parts)]
 
     try:
         app(args=args, standalone_mode=False)
