@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import shlex
@@ -25,6 +26,7 @@ from rich.json import JSON
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.status import Status
+from rich.syntax import Syntax
 
 MAX_CHARS = 12000
 DEFAULT_MODEL = "moonshotai.kimi-k2.5"
@@ -46,9 +48,19 @@ Work simply and directly. Follow OWASP-minded secure defaults: least privilege, 
 
 Be concise. Keep responses to one or two CLI screens. Inspect before changing. Use the smallest change that works.
 
-Prefer built-in workspace tools over shell exploration: use `list` for directory listings, `glob` for file discovery, `grep` for content search, `read` for file contents, and `history` when the user refers to previous conversations ("the fix", "it", "this").
+NEVER use bash for file operations. Use workspace tools instead:
 
-Use `bash` only for commands that truly need a shell, such as builds, tests, package managers, git, or other system commands."""
+  - `list` → directory listings (not `ls`)
+  - `glob` → find files by pattern (not `find`)
+  - `grep` → search file contents (not `grep`/`rg`)
+  - `read` → read file contents (not `cat`/`head`/`tail`)
+  - `history` → prior conversation context
+
+Use `bash` ONLY for: builds, tests, package managers, git, or system commands.
+
+Use `webfetch` to fetch web pages over HTTP/HTTPS. Useful for getting up-to-date documentation, checking library references, or verifying current API details. Automatically follows redirects and truncates large responses.
+"""
+
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console(stderr=True, highlight=False, soft_wrap=True)
@@ -62,9 +74,9 @@ class Spinner:
 
     def __enter__(self) -> None:
         if not sys.stderr.isatty():
-            console.print(f"==> {self.label}")
+            console.print(f"[bright_black]▸[/] {self.label}")
             return
-        self.status = console.status(f"[cyan]{self.label}[/]", spinner="dots")
+        self.status = console.status(f"[dim]{self.label}[/]", spinner="dots")
         self.status.__enter__()
 
     def __exit__(self, *_: object) -> None:
@@ -84,11 +96,35 @@ def render_preview(value: Any, limit: int = 72) -> str:
 
 
 def render_tool_details(**details: Any) -> str:
+    # Shorten common keys for denser output
+    key_shortcuts = {
+        "path": "p",
+        "pattern": "pat",
+        "command": "cmd",
+        "timeout": "t",
+        "offset": "off",
+        "limit": "lim",
+        "chars": "c",
+        "old_chars": "old",
+        "new_chars": "new",
+        "replace_all": "all",
+        "file_glob": "glob",
+        "max_chars": "max",
+        "url": "url",
+        "n": "n",
+    }
     parts = []
     for key, value in details.items():
         if value is None or value == "":
             continue
-        parts.append(f"{key}={render_preview(value)}")
+        k = key_shortcuts.get(key, key)
+        # For booleans, just show key if true
+        if isinstance(value, bool):
+            if value:
+                parts.append(k)
+        else:
+            preview = render_preview(value, limit=50)
+            parts.append(f"{k}={preview}")
     return " ".join(parts)
 
 
@@ -117,20 +153,19 @@ def parse_tool_arguments(args_str: str) -> dict[str, Any]:
         # If no valid JSON is found starting with those brackets, raise the original error
         raise exc
 
-def print_status(label: str, value: str) -> None:
-    console.print(f"[bold cyan]==>[/] {label} [bold]{value}[/]")
-
-
-def print_json_event(
-    title: str, payload: dict[str, Any], border_style: str = "yellow"
-) -> None:
-    if sys.stderr.isatty():
-        console.print(
-            Panel.fit(JSON.from_data(payload), title=title, border_style=border_style)
-        )
-        return
-    console.print(f"==> {title}")
-    console.print(json.dumps(payload, indent=2, ensure_ascii=True))
+def print_event(label: str, value: str | dict[str, Any] | None = None, border_style: str = "yellow") -> None:
+    """Print a status event. If value is a dict, shows as JSON panel; otherwise as text."""
+    if isinstance(value, dict):
+        if sys.stderr.isatty():
+            console.print(Panel.fit(JSON.from_data(value), title=label, border_style=border_style, padding=(0, 1)))
+        else:
+            console.print(f"▸ {label}")
+            console.print(json.dumps(value, indent=2, ensure_ascii=True))
+    else:
+        text = f"[bold cyan]▸[/] {label}"
+        if value:
+            text += f" [bold]{value}[/]"
+        console.print(text)
 
 
 def render_agent_output(text: str) -> None:
@@ -164,13 +199,14 @@ def clip(text: str, limit: int = MAX_CHARS) -> str:
     )
 
 
-def print_preview(text: str, lines: int = 3) -> None:
-    """Print first few lines of output to show progress."""
+def print_preview(text: str, lines: int = 2) -> None:
+    """Print short preview of output."""
     if not text:
         return
     preview_lines = text.splitlines()[:lines]
     for line in preview_lines:
-        console.print(f"  [dim]{line[:120]}[/]")
+        # Truncate to 100 chars for denser display
+        console.print(f"  [bright_black]│[/] [dim]{line[:100]}[/]")
 
 
 def rel(root: Path, path: Path) -> str:
@@ -267,12 +303,14 @@ def has_aws_credentials() -> bool:
         return True
     if os.environ.get("AWS_PROFILE"):
         return shutil.which("aws") is not None
-    aws_creds_path = Path.home() / ".aws" / "credentials"
-    return aws_creds_path.exists() and shutil.which("aws") is not None
+    aws_dir = Path.home() / ".aws"
+    # Check for credentials file OR config file (SSO stores in config)
+    has_config = (aws_dir / "credentials").exists() or (aws_dir / "config").exists()
+    return has_config and shutil.which("aws") is not None
 
 
 def auto_configure_bedrock() -> bool:
-    """Auto-configure Bedrock if AWS is available and OpenAI key isn't set.
+    """Auto-configure Bedrock if AWS is available and OpenAI key is not set.
 
     Sets OPENAI_API_KEY and OPENAI_BASE_URL from Bedrock token generation.
     Returns True if successful, False otherwise.
@@ -317,18 +355,11 @@ def ensure_api_env() -> bool:
     return auto_configure_bedrock()
 
 
-def openai_client() -> OpenAI:
+def get_openai_client(async_: bool = False) -> OpenAI | AsyncOpenAI:
+    """Get an OpenAI client (sync or async)."""
     ensure_api_env()
-    return OpenAI(
-        api_key=str(os.environ["OPENAI_API_KEY"]),
-        base_url=os.environ.get("OPENAI_BASE_URL"),
-        max_retries=3,
-    )
-
-
-def async_openai_client() -> AsyncOpenAI:
-    ensure_api_env()
-    return AsyncOpenAI(
+    cls = AsyncOpenAI if async_ else OpenAI
+    return cls(
         api_key=str(os.environ["OPENAI_API_KEY"]),
         base_url=os.environ.get("OPENAI_BASE_URL"),
         max_retries=3,
@@ -424,7 +455,9 @@ def list_tool(root: Path, path: str = ".", limit: int = 200) -> str:
         rel(root, item) + ("/" if item.is_dir() else "")
         for item in sorted(target.iterdir())[: max(limit, 1)]
     ]
-    return clip("\n".join(items) or "<empty directory>")
+    output = clip("\n".join(items) or "<empty directory>")
+    print_preview(output, lines=1)
+    return output
 
 
 def read_tool(root: Path, path: str, offset: int = 1, limit: int = 200) -> str:
@@ -444,12 +477,15 @@ def write_tool(root: Path, path: str, content: str) -> str:
     target = resolve_path(root, path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
-    return f"wrote {rel(root, target)} ({len(content)} chars)"
+    result = f"wrote {rel(root, target)} ({len(content)} chars)"
+    print_preview(result, lines=1)
+    return result
 
 
 def edit_tool(
     root: Path, path: str, old_text: str, new_text: str, replace_all: bool = False
 ) -> str:
+    """Replace text in an existing workspace file using fuzzy patch matching."""
     if not old_text:
         raise ValueError("old_text must not be empty")
     target = resolve_path(root, path)
@@ -459,16 +495,66 @@ def edit_tool(
         raise ValueError("old_text not found")
     if count > 1 and not replace_all:
         raise ValueError("old_text matched multiple locations; set replace_all=true")
-    target.write_text(
-        text.replace(old_text, new_text)
-        if replace_all
-        else text.replace(old_text, new_text, 1),
-        encoding="utf-8",
-    )
-    amount = count if replace_all else 1
-    return (
-        f"edited {rel(root, target)} ({amount} replacement{'s' if amount != 1 else ''})"
-    )
+    
+    if replace_all:
+        # Replace all occurrences directly
+        target.write_text(text.replace(old_text, new_text), encoding="utf-8")
+        result = f"edited {rel(root, target)} ({count} replacement{'s' if count != 1 else ''})"
+        print_preview(result, lines=1)
+        return result
+    
+    # Build a unified diff for the first occurrence and apply with fuzzy matching
+    import difflib
+    
+    idx = text.find(old_text)
+    # Get text before and after the change
+    before = text[:idx]
+    after = text[idx + len(old_text):]
+    new_content = before + new_text + after
+    
+    # Generate unified diff
+    fromfile = f"a/{path}"
+    tofile = f"b/{path}"
+    diff_lines = list(difflib.unified_diff(
+        text.splitlines(keepends=True),
+        new_content.splitlines(keepends=True),
+        fromfile=fromfile,
+        tofile=tofile,
+        lineterm='\n',
+    ))
+    patch_text = "".join(diff_lines)
+    if not patch_text:
+        # No changes needed
+        result = f"edited {rel(root, target)} (no changes)"
+        print_preview(result, lines=1)
+        return result
+    
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+        handle.write(patch_text)
+        patch_file = handle.name
+    try:
+        result_proc = run(
+            [
+                "patch",
+                "--strip=1",
+                "--directory",
+                str(root),
+                "--input",
+                patch_file,
+                "--forward",
+                "--batch",
+                "--fuzz=3",
+            ]
+        )
+    finally:
+        Path(patch_file).unlink(missing_ok=True)
+    
+    if result_proc.returncode != 0:
+        raise ValueError(clip(f"patch failed: {result_proc.stderr.strip()}"))
+    
+    result = f"edited {rel(root, target)} (1 replacement)"
+    print_preview(result, lines=1)
+    return result
 
 
 def patch_tool(root: Path, patch_text: str) -> str:
@@ -493,6 +579,7 @@ def patch_tool(root: Path, patch_text: str) -> str:
     output = f"exit_code: {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}".strip()
     if result.returncode != 0:
         raise ValueError(clip(output))
+    print_preview(output, lines=1)
     return clip(output)
 
 
@@ -533,7 +620,9 @@ def glob_tool(root: Path, pattern: str, path: str = ".") -> str:
         rel(root, match) + ("/" if match.is_dir() else "")
         for match in sorted(base.glob(pattern))[:200]
     ]
-    return "\n".join(items) or "<no matches>"
+    output = "\n".join(items) or "<no matches>"
+    print_preview(output, lines=1)
+    return clip(output)
 
 
 def webfetch_tool(url: str, max_chars: int = MAX_CHARS) -> str:
@@ -548,7 +637,9 @@ def webfetch_tool(url: str, max_chars: int = MAX_CHARS) -> str:
             response = http.get(url)
             response.raise_for_status()
     prefix = f"url: {response.url}\nstatus: {response.status_code}\ncontent-type: {response.headers.get('content-type', '')}\n\n"
-    return clip(prefix + response.text, max_chars)
+    output = clip(prefix + response.text, max_chars)
+    print_preview(output, lines=1)
+    return output
 
 
 def note_tool_call(deps: AgentDeps, name: str, details: str = "") -> None:
@@ -557,10 +648,21 @@ def note_tool_call(deps: AgentDeps, name: str, details: str = "") -> None:
             f"reached max tool calls ({deps.max_tool_calls}) without a final response"
         )
     deps.tool_calls += 1
-    message = f"==> {name}"
-    if details:
-        message += f" {details}"
-    console.print(message, highlight=False)
+    # Denser format: highlight tool name, dim details
+    if name == "bash" and details.startswith("cmd="):
+        # Special handling for bash commands with syntax highlighting
+        cmd = details[4:]  # Remove "cmd=" prefix
+        if sys.stderr.isatty() and cmd:
+            # Show with syntax highlighting, compact single line style
+            console.print(f"[bright_black]▸[/] [bold]{name}[/]", highlight=False)
+            syntax = Syntax(cmd, "bash", theme="native", word_wrap=True)
+            console.print(syntax)
+        else:
+            console.print(f"[bright_black]▸[/] [bold]{name}[/] [dim]{cmd}[/]", highlight=False)
+    elif details:
+        console.print(f"[bright_black]▸[/] [bold]{name}[/] [dim]{details}[/]", highlight=False)
+    else:
+        console.print(f"[bright_black]▸[/] [bold]{name}[/]", highlight=False)
 
 
 # Tool implementations that take AgentDeps directly
@@ -577,7 +679,7 @@ def tool_edit(
     new_text: str,
     replace_all: bool = False,
 ) -> str:
-    """Replace text in an existing workspace file."""
+    """Replace text in an existing workspace file using fuzzy patch matching for resilience."""
     note_tool_call(
         deps,
         "edit",
@@ -643,7 +745,7 @@ def tool_glob(deps: AgentDeps, pattern: str, path: str = ".") -> str:
 
 
 def tool_webfetch(deps: AgentDeps, url: str, max_chars: int = MAX_CHARS) -> str:
-    """Fetch a web page over HTTP or HTTPS."""
+    """Fetch a web page over HTTP or HTTPS. Use this to get up-to-date documentation, library references, or API details from the web. Follows redirects automatically."""
     note_tool_call(deps, "webfetch", render_tool_details(url=url, max_chars=max_chars))
     return webfetch_tool(url, max_chars)
 
@@ -660,19 +762,34 @@ def _format_size(size: int) -> str:
 
 def tool_history(deps: AgentDeps, n: int = 3) -> str:
     """View the last N command outputs from this workspace history."""
+    # Handle n that might come as string from LLM
+    try:
+        n = int(n) if n is not None else 3
+    except (ValueError, TypeError):
+        n = 3
     note_tool_call(deps, "history", render_tool_details(n=n))
     entries = load_history(deps.root)
     if not entries:
         return "<no history>"
     lines = []
-    for i, entry in enumerate(reversed(entries[-n:]), 1):
+    # Show last n entries, most recent first
+    recent = entries[-n:] if n else entries
+    for i, entry in enumerate(reversed(recent), 1):
         ts = entry.get("timestamp", "unknown")
         prompt = entry.get("prompt", "")
         output = entry.get("output", "")
         output_size = _format_size(len(output.encode("utf-8")))
         prompt_preview = prompt[:60] + "..." if len(prompt) > 60 else prompt
         lines.append(f"{i}. [{ts}] ({output_size}) {prompt_preview}")
-    return "\n".join(lines)
+        # Add output preview (first 2 lines, truncated)
+        if output:
+            output_lines = output.strip().splitlines()[:2]
+            for ol in output_lines:
+                ol_trunc = ol[:80] + "..." if len(ol) > 80 else ol
+                lines.append(f"   {ol_trunc}")
+    result = "\n".join(lines)
+    print_preview(result, lines=1)
+    return result
 
 
 # Tool registry for dispatching tool calls
@@ -690,228 +807,56 @@ TOOLS = {
 }
 
 
-# OpenAI function schemas for each tool
-TOOL_SCHEMAS = [
-    {
+def _schema_from_func(name: str, func: callable) -> dict[str, Any]:
+    """Generate an OpenAI function schema from a tool function's signature."""
+    sig = inspect.signature(func)
+    doc = inspect.getdoc(func) or ""
+    description = doc.split("\n\n")[0].strip() if doc else ""
+    
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    
+    for pname, param in sig.parameters.items():
+        if pname == "deps":
+            continue
+        
+        annotation = param.annotation
+        if annotation is str:
+            ptype = "string"
+        elif annotation is int:
+            ptype = "integer"
+        elif annotation is bool:
+            ptype = "boolean"
+        elif annotation is float:
+            ptype = "number"
+        else:
+            ptype = "string"
+        
+        properties[pname] = {"type": ptype}
+        if param.default is inspect.Parameter.empty:
+            required.append(pname)
+    
+    schema: dict[str, Any] = {
         "type": "function",
         "function": {
-            "name": "write",
-            "description": "Create or overwrite a file in the workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the file relative to workspace root",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Content to write to the file",
-                    },
-                },
-                "required": ["path", "content"],
-            },
+            "name": name,
+            "description": description,
+            "parameters": {"type": "object", "properties": properties},
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit",
-            "description": "Replace text in an existing workspace file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the file relative to workspace root",
-                    },
-                    "old_text": {
-                        "type": "string",
-                        "description": "Text to find and replace",
-                    },
-                    "new_text": {
-                        "type": "string",
-                        "description": "Text to replace with",
-                    },
-                    "replace_all": {
-                        "type": "boolean",
-                        "description": "Replace all occurrences (default: false)",
-                    },
-                },
-                "required": ["path", "old_text", "new_text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "patch",
-            "description": "Apply a unified diff inside the workspace.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "patch_text": {
-                        "type": "string",
-                        "description": "Unified diff text to apply",
-                    },
-                },
-                "required": ["patch_text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list",
-            "description": "List files and directories in a workspace directory. Use this instead of `bash` with `ls`.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory path relative to workspace root (default: .)",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum items to list (default: 200)",
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": "Last resort: run shell commands for builds, tests, git, package managers, or other real terminal tasks.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Shell command to execute",
-                    },
-                    "timeout_seconds": {
-                        "type": "integer",
-                        "description": "Timeout in seconds (default: 120)",
-                    },
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read",
-            "description": "Read a file in the workspace. Use this instead of `cat`, `head`, or `tail`.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the file relative to workspace root",
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "description": "Starting line number (default: 1)",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum lines to read (default: 200)",
-                    },
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "grep",
-            "description": "Search workspace file contents with ripgrep. Use this instead of `grep` or `rg` in bash.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Regex pattern to search for",
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Directory to search in (default: .)",
-                    },
-                    "file_glob": {
-                        "type": "string",
-                        "description": "Optional glob pattern to filter files",
-                    },
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "glob",
-            "description": "Find files or directories with glob patterns. Use this instead of `find` in bash.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Glob pattern (e.g., '*.py', '**/*.md')",
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Base directory (default: .)",
-                    },
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "webfetch",
-            "description": "Fetch a web page over HTTP or HTTPS.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "URL to fetch"},
-                    "max_chars": {
-                        "type": "integer",
-                        "description": f"Maximum characters to return (default: {MAX_CHARS})",
-                    },
-                },
-                "required": ["url"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "history",
-            "description": "View recent conversation history from this workspace, including timestamps and output sizes. Use when user refers to vague things like 'the fix', 'it', 'this', 'as discussed'.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "n": {
-                        "type": "integer",
-                        "description": "Number of history entries to show (default: 3)",
-                    },
-                },
-            },
-        },
-    },
-]
+    }
+    if required:
+        schema["function"]["parameters"]["required"] = required
+    return schema
+
+
+# Generate TOOL_SCHEMAS from tool function signatures
+TOOL_SCHEMAS = [_schema_from_func(name, func) for name, func in TOOLS.items()]
 
 
 def list_model_ids() -> list[str]:
     require_api_env()
     with Spinner("listing models"):
-        models = openai_client().models.list().data
+        models = get_openai_client().models.list().data
     return sorted(model.id for model in models)
 
 
@@ -939,165 +884,108 @@ async def run_agent(
         )
         console.print(f"[dim]Model:[/dim] {model}")
         console.print("[dim]System Prompt:[/dim]")
-        console.print(Panel(system_prompt, title="System", border_style="dim"))
+        console.print(Panel(system_prompt, title="System", border_style="dim", padding=(0, 1)))
         console.print("[dim]User Prompt:[/dim]")
-        console.print(Panel(prompt, title="User", border_style="blue"))
+        console.print(Panel(prompt, title="User", border_style="blue", padding=(0, 1)))
     else:
         console.print(
-            f"[dim]→ Sending prompt:[/dim] {prompt[:200]}{'...' if len(prompt) > 200 else ''}"
+            f"[dim]→[/] {prompt[:100]}{'...' if len(prompt) > 100 else ''}"
         )
+
+    async def agent_loop(client: httpx.AsyncClient) -> tuple[int, str]:
+        """Single agent loop - reused for retries."""
+        step = 0
+        while step < max_steps:
+            step += 1
+
+            request_body = {
+                "model": model,
+                "messages": messages,
+                "tools": TOOL_SCHEMAS,
+                "tool_choice": "auto",
+            }
+
+            with Spinner("waiting for model"):
+                response = await client.post("/chat/completions", json=request_body)
+                response.raise_for_status()
+                data = response.json()
+
+            if debug:
+                console.print("[dim]Request JSON:[/dim]")
+                console.print_json(json.dumps(request_body))
+                console.print("[dim]Response JSON:[/dim]")
+                console.print_json(json.dumps(data))
+
+                last_msg = request_body["messages"][-1]
+                role = last_msg.get("role", "unknown")
+                content = last_msg.get("content", "") or ""
+                tool_calls = last_msg.get("tool_calls")
+                console.print(f"[dim]Request ({role}):[/dim] {content[:200]}{'...' if len(content) > 200 else ''}")
+                if tool_calls:
+                    for tc in tool_calls:
+                        if tc.get("type") == "function":
+                            fn = tc["function"]
+                            console.print(f"[dim]  → {fn.get('name')}:[/dim] {str(fn.get('arguments', ''))[:100]}{'...' if len(str(fn.get('arguments', ''))) > 100 else ''}")
+
+                choice_msg = data["choices"][0]["message"]
+                resp_content = choice_msg.get("content", "") or ""
+                resp_tool_calls = choice_msg.get("tool_calls")
+                if resp_content:
+                    console.print(f"[dim]Response:[/dim] {resp_content[:200]}{'...' if len(resp_content) > 200 else ''}")
+                if resp_tool_calls:
+                    for tc in resp_tool_calls:
+                        if tc.get("type") == "function":
+                            fn = tc["function"]
+                            console.print(f"[dim]  → {fn.get('name')}:[/dim] {str(fn.get('arguments', ''))[:100]}{'...' if len(str(fn.get('arguments', ''))) > 100 else ''}")
+
+            choice = data["choices"][0]
+            message = choice["message"]
+
+            if "tool_calls" in message and message["tool_calls"]:
+                messages.append(message)
+
+                for tool_call in message["tool_calls"]:
+                    if tool_call["type"] != "function":
+                        continue
+
+                    function = tool_call["function"]
+                    tool_name = function["name"]
+                    args_str = function["arguments"]
+                    tool_args = parse_tool_arguments(args_str)
+                    function["arguments"] = json.dumps(tool_args)
+
+                    if tool_name not in TOOLS:
+                        result = f"Error: Unknown tool '{tool_name}'"
+                    else:
+                        try:
+                            result = TOOLS[tool_name](deps, **tool_args)
+                        except Exception as e:
+                            result = f"Error: {e}"
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": str(result),
+                    })
+            else:
+                output = message["content"] or ""
+                render_agent_output(output)
+                if save_to_history:
+                    save_history(root, prompt, output)
+                return 0, output
+
+        return fail(f"reached max steps ({max_steps}) without a final response"), ""
 
     try:
         async with get_api_client() as client:
-            step = 0
-            while step < max_steps:
-                step += 1
-
-                request_body = {
-                    "model": model,
-                    "messages": messages,
-                    "tools": TOOL_SCHEMAS,
-                    "tool_choice": "auto",
-                }
-
-                with Spinner("waiting for model"):
-                    response = await client.post(
-                        "/chat/completions",
-                        json=request_body,
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-
-                if debug:
-                    # Show raw request/response JSON
-                    console.print("[dim]Request JSON:[/dim]")
-                    console.print_json(json.dumps(request_body))
-                    console.print("[dim]Response JSON:[/dim]")
-                    console.print_json(json.dumps(data))
-
-                    # Also show summarized content and tool calls from last message
-                    last_msg = request_body["messages"][-1]
-                    role = last_msg.get("role", "unknown")
-                    content = last_msg.get("content", "") or ""
-                    tool_calls = last_msg.get("tool_calls")
-                    console.print(f"[dim]Request ({role}):[/dim] {content[:200]}{'...' if len(content) > 200 else ''}")
-                    if tool_calls:
-                        for tc in tool_calls:
-                            if tc.get("type") == "function":
-                                fn = tc["function"]
-                                console.print(f"[dim]  → {fn.get('name')}:[/dim] {str(fn.get('arguments', ''))[:100]}{'...' if len(str(fn.get('arguments', ''))) > 100 else ''}")
-
-                    # Show just the model's content and tool calls from response
-                    choice_msg = data["choices"][0]["message"]
-                    resp_content = choice_msg.get("content", "") or ""
-                    resp_tool_calls = choice_msg.get("tool_calls")
-                    if resp_content:
-                        console.print(f"[dim]Response:[/dim] {resp_content[:200]}{'...' if len(resp_content) > 200 else ''}")
-                    if resp_tool_calls:
-                        for tc in resp_tool_calls:
-                            if tc.get("type") == "function":
-                                fn = tc["function"]
-                                console.print(f"[dim]  → {fn.get('name')}:[/dim] {str(fn.get('arguments', ''))[:100]}{'...' if len(str(fn.get('arguments', ''))) > 100 else ''}")
-
-                choice = data["choices"][0]
-                message = choice["message"]
-
-                # Check if model wants to call tools
-                if "tool_calls" in message and message["tool_calls"]:
-                    messages.append(message)
-
-                    # Execute each tool call
-                    for tool_call in message["tool_calls"]:
-                        if tool_call["type"] != "function":
-                            continue
-
-                        function = tool_call["function"]
-                        tool_name = function["name"]
-                        args_str = function["arguments"]
-                        tool_args = parse_tool_arguments(args_str)
-                        function["arguments"] = json.dumps(tool_args)
-
-                        if tool_name not in TOOLS:
-                            result = f"Error: Unknown tool '{tool_name}'"
-                        else:
-                            try:
-                                result = TOOLS[tool_name](deps, **tool_args)
-                            except Exception as e:
-                                result = f"Error: {e}"
-
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tool_call["id"],
-                                "content": str(result),
-                            }
-                        )
-                else:
-                    # Model has provided final response
-                    output = message["content"] or ""
-                    render_agent_output(output)
-                    if save_to_history:
-                        save_history(root, prompt, output)
-                    return 0, output
-
-            return fail(f"reached max steps ({max_steps}) without a final response"), ""
-
+            return await agent_loop(client)
     except httpx.HTTPStatusError as exc:
         # Retry once on auth failure if using Bedrock (token may have expired)
         if exc.response.status_code in (401, 403) and refresh_bedrock_token():
             console.print("[dim]Bedrock token expired, refreshing...[/]")
-            # Retry with new client
             try:
                 async with get_api_client() as client:
-                    step = 0
-                    while step < max_steps:
-                        step += 1
-                        request_body = {
-                            "model": model,
-                            "messages": messages,
-                            "tools": TOOL_SCHEMAS,
-                            "tool_choice": "auto",
-                        }
-                        with Spinner("waiting for model"):
-                            response = await client.post(
-                                "/chat/completions",
-                                json=request_body,
-                            )
-                            response.raise_for_status()
-                            data = response.json()
-                        choice = data["choices"][0]
-                        message = choice["message"]
-                        if "tool_calls" in message and message["tool_calls"]:
-                            messages.append(message)
-                            for tool_call in message["tool_calls"]:
-                                if tool_call["type"] != "function":
-                                    continue
-                                function = tool_call["function"]
-                                tool_name = function["name"]
-                                args_str = function["arguments"]
-                                tool_args = parse_tool_arguments(args_str)
-                                function["arguments"] = json.dumps(tool_args)
-                                if tool_name not in TOOLS:
-                                    result = f"Error: Unknown tool '{tool_name}'"
-                                else:
-                                    try:
-                                        result = TOOLS[tool_name](deps, **tool_args)
-                                    except Exception as e:
-                                        result = f"Error: {e}"
-                                messages.append(
-                                    {
-                                        "role": "tool",
-                                        "tool_call_id": tool_call["id"],
-                                        "content": str(result),
-                                    }
-                                )
-                        else:
-                            output = message["content"] or ""
-                            render_agent_output(output)
-                            if save_to_history:
-                                save_history(root, prompt, output)
-                            return 0, output
-                    return fail(f"reached max steps ({max_steps}) without a final response"), ""
+                    return await agent_loop(client)
             except httpx.HTTPStatusError as retry_exc:
                 exc = retry_exc
             except Exception as retry_exc:
@@ -1146,8 +1034,8 @@ def run_command(
         if not system_file
         else SYSTEM_PROMPT + "\n\n" + system_file.read_text(encoding="utf-8")
     )
-    print_status("root", str(workspace))
-    print_status("model", chosen_model)
+    print_event("root", str(workspace))
+    print_event("model", chosen_model)
     exit_code, _ = asyncio.run(
         run_agent(
             task,
