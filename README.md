@@ -20,8 +20,9 @@ Network: `webfetch` (for docs, API lookups)
 ## Requirements
 
 - Python 3.14+
-- `bash`, `patch`, `rg` (ripgrep)
-- OpenAI API key OR AWS credentials (for Bedrock)
+- `bash`, `patch`
+- (Optional) `rg` (ripgrep) or `grep` for search support
+- OpenAI API key OR AWS CLI auth (for Bedrock)
 
 ## Installation
 
@@ -41,7 +42,9 @@ This installs the `oy` command.
 
 ## AWS Bedrock (automatic)
 
-If you have AWS credentials configured, Bedrock is auto-configured:
+If your AWS CLI can auth, Bedrock is auto-configured. `oy` uses the same
+profile/session the `aws` command would use, and can auto-run
+`aws sso login --use-device-code --no-browser` when an SSO session is stale.
 
 ```bash
 oy models
@@ -67,6 +70,10 @@ For OpenAI-compatible endpoints:
 export OPENAI_BASE_URL=https://your-endpoint.example/v1
 export OPENAI_API_KEY=...
 ```
+
+`oy` tries the Responses API first and falls back to Chat Completions when the
+provider rejects it before any tool runs. Override with
+`OY_RESPONSES=auto|always|never`.
 
 ## Commands
 
