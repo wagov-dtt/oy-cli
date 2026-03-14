@@ -906,11 +906,13 @@ def get_client(async_=False):
 def resolve_path(root, raw):
     """Resolve a path relative to root, preventing escape via .. traversal.
 
-    If the resolved path would escape root, returns root / basename instead.
+    Raises ValueError if the resolved path would escape root.
     This is a security measure to constrain file access to the workspace.
     """
     path = (root / raw).resolve()
-    return path if path == root or root in path.parents else root / Path(raw).name
+    if path == root or root in path.parents:
+        return path
+    raise ValueError(f"Path traversal denied: '{raw}' escapes workspace")
 
 
 def apply_exact_replace(text, old, new, replace_all=False):

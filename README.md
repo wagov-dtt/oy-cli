@@ -153,6 +153,11 @@ oy "fix the failing test"
 
 Use `oy models` to interactively select a default model.
 
+## Links
+
+- [Issues](ISSUES.md) — Known issues and audit findings
+- [Contributing](CONTRIBUTING.md) — How to contribute
+
 ## Requirements
 
 - Python 3.14+
