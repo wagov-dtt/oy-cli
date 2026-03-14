@@ -25,9 +25,11 @@ from openai import (
     PermissionDeniedError,
     RateLimitError,
 )
-from rich.console import Console
+from rich.console import Console, Group
 from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.prompt import Prompt
+from rich.text import Text
 
 __version__ = "0.2.0"
 # Per-tool payloads should stay comfortable for long sessions on 128k-ish models.
@@ -131,6 +133,8 @@ _using_bedrock = False
 _last_api_env_error = None
 STDOUT = Console()
 STDERR = Console(stderr=True)
+# Fit terminal display nicely; Rich handles wrapping automatically
+DISPLAY_MAX_WIDTH = 120  # Reasonable max width for tool output previews
 HTML_MARKERS = ("text/html", "application/xhtml+xml")
 HTTPX_PRESET = {"type": "string", "enum": ["page", "json", "post_json"]}
 HTTPX_RESPONSE_MODE = {"type": "string", "enum": ["auto", "headers", "body", "json"]}
@@ -149,6 +153,21 @@ def markdown(text="", *, stderr=False):
 def code_block(text, language="text"):
     body = str(text).rstrip("\n")
     return f"```{language}\n{body}\n```"
+
+
+def format_bash_result(command, returncode, stdout, stderr):
+    """Format bash command output as a pretty markdown block."""
+    parts = [f"```bash", f"$ {command}"]
+    stdout = (stdout or "").rstrip()
+    stderr = (stderr or "").rstrip()
+    if stdout:
+        parts.append(stdout)
+    if returncode != 0:
+        parts.append(f"# exit {returncode}")
+    if stderr:
+        parts.extend(["# stderr:", stderr])
+    parts.append("```")
+    return "\n".join(parts)
 
 
 def inline_code(text):
@@ -354,9 +373,43 @@ def render_httpx_output(response, response_mode, json_path=None):
 
 
 def show(text, lines=2):
-    snippet = "\n".join(line[:120] for line in text.splitlines()[: max(lines, 0)])
-    if snippet:
-        markdown(code_block(snippet), stderr=True)
+    """Display a preview of tool output with intelligent truncation.
+    
+    Uses Rich to automatically handle line wrapping and truncation.
+    Shows first N lines (default 2) with lines wrapped at 120 chars max.
+    For code blocks, detects and preserves proper fencing.
+    """
+    if not text:
+        return
+    
+    lines_to_show = max(lines, 0)
+    text_lines = text.splitlines()
+    
+    if len(text_lines) <= lines_to_show:
+        # Output fits, just render it with Rich wrapping
+        STDERR.print(Text(text), width=DISPLAY_MAX_WIDTH, overflow="fold")
+        return
+    
+    # Need to truncate: show first N lines with Rich wrapping
+    snippet = "\n".join(text_lines[:lines_to_show])
+    total_lines = len(text_lines)
+    omitted_lines = total_lines - lines_to_show
+    
+    # Check if we've created an unclosed code block by truncation
+    # Count fences in snippet vs full text
+    snippet_fences = snippet.count("```")
+    full_fences = text.count("```")
+    needs_close = snippet_fences % 2 == 1 and full_fences % 2 == 0
+    
+    # Build output with Rich Group
+    parts = [Text(snippet)]
+    if omitted_lines > 0:
+        msg = "line" if omitted_lines == 1 else "lines"
+        parts.append(Text(f"\n... [{omitted_lines} more {msg}]", style="dim"))
+    if needs_close:
+        parts.append(Text("\n```"))
+    
+    STDERR.print(Group(*parts), width=DISPLAY_MAX_WIDTH, overflow="fold")
 
 
 def render_markdown(text):
@@ -906,11 +959,9 @@ def tool_bash(state, command, timeout_seconds=120):
         env=env,
         timeout=timeout_seconds,
     )
-    out = clip(
-        f"exit_code: {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}".strip(),
-        tail_chars=MAX_TOOL_OUTPUT_TAIL_CHARS,
-    )
-    show(out, 3)
+    out = format_bash_result(command, result.returncode, result.stdout, result.stderr)
+    out = clip(out, tail_chars=MAX_TOOL_OUTPUT_TAIL_CHARS)
+    show(out, 8)
     return out
 
 
