@@ -31,7 +31,7 @@ oy "summarize this API doc"  # agent uses httpx tool
 Most AI coding tools are large, complex, or lock you into specific providers. `oy` is ~1000 lines of straightforward Python with a minimal tool surface. Easy to audit, easy to understand, easy to run safely.
 
 **Design goals:**
-- Small, auditable codebase
+- Small, auditable codebase (under 2kloc target)
 - Minimal tool surface (8 tools)
 - Works with OpenAI or AWS Bedrock
 - Fresh session each run (no hidden state)
