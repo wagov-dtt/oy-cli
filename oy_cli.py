@@ -1574,7 +1574,7 @@ def model():
 
 def main(argv: list[str] | None = None):
     args = list(sys.argv[1:] if argv is None else argv)
-    commands = {"run", "bedrock-token", "models", "model", "-h", "--help"}
+    commands = {"run", "models", "model", "-h", "--help"}
     if not args:
         args = ["run"] if not sys.stdin.isatty() else ["--help"]
     elif args[0] in {"-v", "--version"}:
@@ -1583,7 +1583,7 @@ def main(argv: list[str] | None = None):
     elif args[0] not in commands:
         args = ["run", *args]
     result = defopt.run(
-        [run, bedrock_token, models, model], argv=args, version=False, short={}
+        [run, models, model], argv=args, version=False, short={}
     )
     return 0 if result is None else result
 

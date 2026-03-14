@@ -84,12 +84,6 @@ oy models moonshot
 oy model
 ```
 
-To view Bedrock token exports for copy/paste into another shell:
-
-```bash
-oy bedrock-token
-```
-
 ## OpenAI API
 
 ```bash
@@ -111,7 +105,6 @@ oy "prompt"              # Run with a prompt
 oy models                # Interactive model picker
 oy models <query>        # Start picker with a filter
 oy model                 # Show current model
-oy bedrock-token         # Show Bedrock export commands
 ```
 
 ## Security
