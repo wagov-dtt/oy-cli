@@ -11,9 +11,11 @@ requires-python = ">=3.14"
 license = "Apache-2.0"
 authors = [{ name = "oy-cli contributors" }]
 dependencies = [
+  "defopt>=7.0.0",
   "httpx>=0.28.1",
+  "markdownify>=1.2.0",
   "openai>=1.68.0",
-  "typer>=0.16.0",
+  "rich>=14.3.0",
 ]
 
 [dependency-groups]

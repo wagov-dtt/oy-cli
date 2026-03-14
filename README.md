@@ -15,7 +15,40 @@ Most AI coding tools are large, complex, or lock you into specific providers. `o
 
 File operations: `read` `write` `edit` `patch` `list` `glob` `grep`  
 Shell: `bash` (for builds, tests, git)  
-Network: `webfetch` (for docs, API lookups)
+Network: `webfetch` (for docs, API lookups; HTML is compacted to markdown)  
+Collaboration: `ask` (interactive runs only, for approvals, checkpoints, and feedback)
+
+## Agent Notes
+
+- The built-in system prompt tells the agent to inspect before editing and prefer the narrowest tool that fits.
+- Tool output is clipped to keep long tasks inside model context. Most tool results are capped at about 16k chars, `bash` / unified `patch` keep both the start and end when clipped, and `webfetch` defaults to about 20k chars after HTML-to-markdown compaction.
+- Each `oy` run is a fresh session. It does not inject workspace history into later runs, so the agent should rely on the current prompt plus current tool results.
+- When output is clipped, the intended recovery path is to narrow the query: use `read` with offsets, `grep`, `glob`, `list`, or another focused `webfetch` instead of guessing.
+- By default, interactive runs keep `ask` enabled and the system prompt encourages using it for plans, reviews, ambiguous product decisions, and meaningful checkpoints.
+- `OY_NON_INTERACTIVE=1` removes the `ask` tool from the run and swaps in a prompt that tells the agent to keep going without interruptions and recover from faults when it can.
+- For broad or risky changes, the prompt nudges the agent to ask whether it should summarise and commit the current state first so undo is easy.
+- Before ending with a normal completion summary after making changes, the prompt nudges the agent to ask whether it should summarise and commit the completed work.
+- `patch` supports both normal unified diffs and the friendlier file-oriented format starting with `*** Begin Patch`.
+
+## Configuration
+
+`oy` keeps the run command short and expects most per-run configuration to come from env vars:
+
+```bash
+export OY_MODEL=zai.glm-5
+export OY_NON_INTERACTIVE=1
+export OY_SYSTEM_FILE=./ops/system.txt
+export OY_ROOT=/path/to/workspace
+export OY_RESPONSES=auto
+oy "fix the failing test"
+```
+
+- `OY_MODEL`: override the configured default model for this shell/session
+- `OY_NON_INTERACTIVE=1`: disable `ask` and run straight through without checkpoints
+- `OY_SYSTEM_FILE`: append extra system instructions from a file
+- `OY_ROOT`: run against a workspace without changing shell directories
+- `OY_RESPONSES=auto|always|never`: control Responses API fallback behavior
+- `OY_CONFIG`: override the config file path used for persisted settings like the default model
 
 ## Requirements
 
@@ -48,13 +81,14 @@ profile/session the `aws` command would use, and can auto-run
 
 ```bash
 oy models
-oy model moonshotai.kimi-k2.5
+oy models moonshot
+oy model
 ```
 
-To export Bedrock tokens for other tools:
+To view Bedrock token exports for copy/paste into another shell:
 
 ```bash
-eval "$(oy bedrock-token)"
+oy bedrock-token
 ```
 
 ## OpenAI API
@@ -79,10 +113,10 @@ provider rejects it before any tool runs. Override with
 
 ```bash
 oy "prompt"              # Run with a prompt
-oy models                # List available models
-oy model <id>            # Set default model
+oy models                # Interactive model picker
+oy models <query>        # Start picker with a filter
 oy model                 # Show current model
-oy bedrock-token         # Export Bedrock credentials
+oy bedrock-token         # Show Bedrock export commands
 ```
 
 ## Security
