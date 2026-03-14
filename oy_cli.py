@@ -25,11 +25,10 @@ from openai import (
     PermissionDeniedError,
     RateLimitError,
 )
-from rich.console import Console, Group
+from rich.console import Console
 from rich.markdown import Markdown
-from rich.panel import Panel
+
 from rich.prompt import Prompt
-from rich.text import Text
 
 __version__ = "0.2.0"
 # Per-tool payloads should stay comfortable for long sessions on 128k-ish models.
@@ -157,7 +156,7 @@ def code_block(text, language="text"):
 
 def format_bash_result(command, returncode, stdout, stderr):
     """Format bash command output as a pretty markdown block."""
-    parts = [f"```bash", f"$ {command}"]
+    parts = ["```bash", f"$ {command}"]
     stdout = (stdout or "").rstrip()
     stderr = (stderr or "").rstrip()
     if stdout:
@@ -374,42 +373,42 @@ def render_httpx_output(response, response_mode, json_path=None):
 
 def show(text, lines=2):
     """Display a preview of tool output with intelligent truncation.
-    
-    Uses Rich to automatically handle line wrapping and truncation.
-    Shows first N lines (default 2) with lines wrapped at 120 chars max.
+
+    Renders as Markdown for proper code block display.
+    Shows first N lines (default 2) with truncation indicator if needed.
     For code blocks, detects and preserves proper fencing.
     """
     if not text:
         return
-    
+
     lines_to_show = max(lines, 0)
     text_lines = text.splitlines()
-    
+
     if len(text_lines) <= lines_to_show:
-        # Output fits, just render it with Rich wrapping
-        STDERR.print(Text(text), width=DISPLAY_MAX_WIDTH, overflow="fold")
+        # Output fits, render as markdown
+        STDERR.print(Markdown(text), width=DISPLAY_MAX_WIDTH, overflow="fold")
         return
-    
-    # Need to truncate: show first N lines with Rich wrapping
+
+    # Need to truncate: show first N lines
     snippet = "\n".join(text_lines[:lines_to_show])
     total_lines = len(text_lines)
     omitted_lines = total_lines - lines_to_show
-    
+
     # Check if we've created an unclosed code block by truncation
     # Count fences in snippet vs full text
     snippet_fences = snippet.count("```")
     full_fences = text.count("```")
     needs_close = snippet_fences % 2 == 1 and full_fences % 2 == 0
-    
-    # Build output with Rich Group
-    parts = [Text(snippet)]
+
+    # Build output as markdown with truncation marker
+    parts = [snippet]
     if omitted_lines > 0:
         msg = "line" if omitted_lines == 1 else "lines"
-        parts.append(Text(f"\n... [{omitted_lines} more {msg}]", style="dim"))
+        parts.append(f"\n... [{omitted_lines} more {msg}]")
     if needs_close:
-        parts.append(Text("\n```"))
-    
-    STDERR.print(Group(*parts), width=DISPLAY_MAX_WIDTH, overflow="fold")
+        parts.append("\n```")
+
+    STDERR.print(Markdown("\n".join(parts)), width=DISPLAY_MAX_WIDTH, overflow="fold")
 
 
 def render_markdown(text):
@@ -808,7 +807,12 @@ def note_tool(state, name, **details):
         if value not in (None, "", False)
     ]
     detail_text = ", ".join(parts)
-    status(f"tool {inline_code(name)}" + (f": {detail_text}" if detail_text else ""))
+    message = f"tool {inline_code(name)}" + (f": {detail_text}" if detail_text else "")
+    # Use bullet for mutating tools (apply, bash), plain for idempotent reads
+    if name in {"apply", "bash"}:
+        markdown(f"● {message}", stderr=True)
+    else:
+        markdown(message, stderr=True)
 
 
 def tool_list(state, path=".", limit=200):
