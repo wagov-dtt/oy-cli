@@ -46,35 +46,35 @@ BASE_SYSTEM_PROMPT = """You are oy, a tiny local coding assistant.
 
 ## Core Principles
 
-- Work simply, inspect before changing, and prefer secure boring solutions.
-- Each run is a fresh session: never assume hidden memory, saved history, or prior conversation state beyond the current prompt and tool results.
-- If the user refers to earlier work and context is missing, ask them to restate or paste it instead of guessing.
+- Work simply, inspect before changing, prefer secure boring solutions.
+- Each run is a fresh session: no hidden memory or prior conversation state.
+- If context is missing, ask the user to restate or paste it—don't guess.
 - Keep answers concise but thorough—stay on task until finished or blocked.
 
 ## Tool Selection Guide
 
-- **read**: Inspect files before editing. Use offset/limit for large files. Always read first unless you created the file this session.
-- **list/glob**: Discover structure before diving deep. Use list for directories, glob for pattern matching.
-- **grep**: Find code by text or regex. Use before read when you know the pattern but not the location.
-- **apply**: Make file changes. Supports replace (exact string match), write (new files), move, and delete. Batch multiple operations when they're related.
-- **bash**: Run shell commands for builds, tests, git, or package managers. Avoid for file reading—use read instead.
-- **httpx**: Fetch web pages or call APIs. Use preset='json' for APIs, preset='page' for HTML (auto-converts to markdown).
+| Need | Tool | Notes |
+|------|------|-------|
+| Read a file | read | Always read first. Use offset/limit for large files. |
+| List directory | list | Discover structure before diving deep. |
+| Find by pattern | glob | Know the filename pattern but not the path? Use this. |
+| Search contents | grep | Know the text/regex but not the file? Use this. |
+| Edit files | apply | Replace exact strings, write new files, move, or delete. Batch related edits. |
+| Run commands | bash | For builds, tests, git, package managers. Not for reading files. |
+| Fetch web/API | httpx | Fetch documentation, standards, API responses. Presets: 'page' (HTML→markdown), 'json', 'post_json'. |
 
 ## Output Truncation
 
-Tool output is clipped to preserve context:
-- Most tools: ~16k chars max
-- bash: keeps start AND end when clipped (look for "... [N chars omitted] ..." markers)
-- httpx: ~20k chars
+Tool output clips to preserve context (~16k chars, ~20k for httpx). Bash preserves both head AND tail.
 
-When clipped, narrow your query: use read with offsets, grep, glob, list, or follow-up httpx calls—never guess at missing content.
+When clipped: use read with offsets, grep, glob, list, or follow-up httpx calls—never guess.
 
 ## File Editing Workflow
 
-1. Read the file first to understand current state.
-2. Use apply with exact string replacement for targeted edits.
+1. Read the file first.
+2. Use apply with exact string replacement.
 3. For new files, use apply with op='write'.
-4. Batch related operations in a single apply call for atomicity.
+4. Batch related operations.
 """
 INTERACTIVE_SYSTEM_PROMPT = """## Interactive Mode
 
@@ -131,6 +131,52 @@ Only stop when truly blocked. If blocked, provide a concise status:
 3. The smallest useful next step for the operator
 
 Never stop at the first failure—always attempt recovery first.
+"""
+AUDIT_SYSTEM_PROMPT = """## Security and Complexity Audit
+
+You are conducting a security and code quality audit of this repository.
+
+### Get Current Standards
+
+Use httpx to fetch the latest verification standards before auditing:
+
+- **ASVS** (Application Security Verification Standard): https://raw.githubusercontent.com/OWASP/ASVS/master/README.md
+- **MSVS** (Mobile Security Verification Standard): https://raw.githubusercontent.com/OWASP/owasp-masvs/master/README.md
+- **OWASP Top 10**: https://owasp.org/Top10/
+
+Start by fetching these resources to ensure your audit reflects current guidance.
+
+### Audit Process
+
+1. Fetch current ASVS/MSVS standards via httpx
+2. Explore the repository structure systematically
+3. Read and analyze all source code files
+4. Identify security vulnerabilities against ASVS/MSVS requirements
+5. Evaluate code complexity (simplicity, maintainability, avoid over-engineering)
+6. Prioritize issues by severity and actionability
+7. Document findings with specific file paths and line numbers
+
+### Output Requirements
+
+You MUST produce a final report in this exact format:
+
+```
+## Audit Complete
+
+[FINDINGS_JSON]
+```
+
+Where [FINDINGS_JSON] is a JSON array of 15 or fewer findings, each with:
+- "title": Brief issue title
+- "severity": "critical", "high", "medium", or "low"
+- "file": File path relative to repository root
+- "line": Line number (integer)
+- "description": What the issue is and why it matters
+- "recommendation": Specific action to fix it
+- "standard": ASVS/MSVS chapter reference (e.g., "ASVS V5: Security Configuration") or "complexity" for code quality issues
+- "category": "security" or "complexity"
+
+Do NOT output anything after the findings JSON. The JSON must be the last thing in your response.
 """
 BREW_CANDIDATES = [
     Path("/home/linuxbrew/.linuxbrew/bin/brew"),
@@ -1209,72 +1255,52 @@ def tool_ask(state, question, choices=None):
 TOOL_SPECS = {
     "apply": (
         tool_apply,
-        "Apply one or more structured file operations in the workspace. "
-        "Use for all file modifications. Operations: "
-        "replace (exact string match, requires old and new), "
-        "write (create new file with content, use overwrite=true for existing files), "
-        "move (rename file, requires to path), "
-        "delete (remove file). "
-        "Batch related operations in a single call. Always read the file first before using replace.",
+        "Apply structured file operations in the workspace. Operations: "
+        "replace (exact string match), write (new file, use overwrite=true for existing), "
+        "move (rename), delete (remove). Batch related operations. Read files first.",
         {"operations": APPLY_OPERATIONS},
         ["operations"],
     ),
     "list": (
         tool_list,
-        "List files and directories in a workspace directory. "
-        "Use to discover structure before deeper exploration. "
-        "Returns entries sorted alphabetically with trailing / for directories. "
-        "Prefer list over glob when exploring an unfamiliar directory tree.",
+        "List directory contents. Use to discover structure before exploring deeper. "
+        "Sorted alphabetically, trailing / for directories. Prefer over glob for unfamiliar trees.",
         {"path": STR, "limit": INT},
         [],
     ),
     "bash": (
         tool_bash,
-        "Run shell commands for builds, tests, git, or package managers. "
-        "NOT for file reading—use read instead. "
-        "NOT for searching—use grep instead. "
-        "Use for: git operations, npm/pip/make commands, running tests, one-off scripts. "
-        "Output shows both stdout and stderr; clipped output preserves head and tail.",
+        "Run shell commands: builds, tests, git, npm/pip/make, scripts. "
+        "Not for reading files (use read) or searching (use grep). Shows stdout and stderr.",
         {"command": STR, "timeout_seconds": INT},
         ["command"],
     ),
     "read": (
         tool_read,
-        "Read a workspace file or directory listing. "
-        "ALWAYS read before editing—never guess file contents. "
-        "Use offset and limit for large files (line numbers are included). "
-        "For directories, returns the same as list. "
-        "This is the primary file inspection tool.",
+        "Read a file or directory. ALWAYS read before editing. "
+        "Use offset/limit for large files. Line numbers included. Primary inspection tool.",
         {"path": STR, "offset": INT, "limit": INT},
         ["path"],
     ),
     "grep": (
         tool_grep,
-        "Search workspace file contents by text or regex pattern. "
-        "Use before read when you know what to find but not where it is. "
-        "Supports ripgrep (preferred) or standard grep. "
-        "Use file_glob to restrict search to specific file types (e.g., '*.py'). "
-        "Returns matching lines with file paths and line numbers.",
+        "Search file contents by text/regex. Use when you know what to find but not where. "
+        "Use file_glob to filter by extension (e.g., '*.py'). Returns lines with file:line.",
         {"pattern": STR, "path": STR, "file_glob": STR},
         ["pattern"],
     ),
     "glob": (
         tool_glob,
-        "Find files or directories by name pattern (e.g., '*.py', 'src/**/*.js'). "
-        "Use when you know the filename pattern but not the exact path. "
-        "For discovering directory structure, prefer list instead. "
-        "Supports standard glob patterns: * any chars, ? single char, ** recursive.",
+        "Find files by name pattern ('*.py', 'src/**/*.js'). Use when you know the pattern. "
+        "For exploring structure, use list instead. Supports *, ?, **.",
         {"pattern": STR, "path": STR},
         ["pattern"],
     ),
     "httpx": (
         tool_httpx,
-        "Fetch web pages or call HTTP APIs. "
-        "Smart defaults: infers GET/POST from body presence, auto-detects JSON responses. "
-        "Presets: 'page' for HTML (auto-converts to markdown), 'json' for API responses, 'post_json' for POST with JSON body. "
-        "Use json_path to extract nested fields (e.g., 'data.items.0.name'). "
-        "Use max_chars to limit output size. "
-        "Headers like Authorization are redacted in output for safety.",
+        "Fetch web pages or APIs. Use to get documentation, standards, or API data. "
+        "Presets: 'page' (HTML→markdown), 'json' (API response), 'post_json' (POST JSON). "
+        "Use json_path for nested extraction. Headers like Authorization are redacted.",
         {
             "url": STR,
             "preset": HTTPX_PRESET,
@@ -1292,11 +1318,9 @@ TOOL_SPECS = {
     ),
     "ask": (
         tool_ask,
-        "Ask the user a question and return their response. "
-        "Use for: plan approval, ambiguous decisions, checkpoints, commit offers. "
-        "Provide choices for multiple-choice questions (user can enter number or exact text). "
-        "Only available in interactive mode—unavailable when stdin is not a TTY. "
-        "Do not use for trivial decisions; batch work and ask at meaningful checkpoints.",
+        "Ask the user a question. Use for plan approvals, ambiguous decisions, checkpoints. "
+        "Provide choices for multiple-choice. Only available in interactive mode. "
+        "Batch work and ask at meaningful checkpoints, not after every trivial step.",
         {"question": STR, "choices": STRINGS},
         ["question"],
     ),
@@ -1543,6 +1567,146 @@ def read_system_prompt(system_file, interactive):
     return system_prompt + "\n\n" + extra
 
 
+def parse_audit_findings(output: str) -> list[dict]:
+    """Parse audit findings JSON from the LLM output."""
+    import re
+
+    # Try to find JSON array in the output
+    matches = list(re.finditer(r'\[\s*\{.*?\}\s*\]', output, re.DOTALL))
+    if not matches:
+        return []
+
+    json_str = matches[-1].group(0)
+    try:
+        findings = json.loads(json_str)
+        if isinstance(findings, list):
+            return [f for f in findings if isinstance(f, dict)]
+    except json.JSONDecodeError:
+        pass
+    return []
+
+
+def write_issues_file(root: Path, findings: list[dict]) -> None:
+    """Write or update ISSUES.md with audit findings."""
+    issues_path = root / "ISSUES.md"
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    new_content = f"""# Audit Findings
+
+> Last audit: {timestamp}
+
+## Summary
+
+Total issues found: {len(findings)}
+
+"""
+
+    by_severity = {"critical": [], "high": [], "medium": [], "low": []}
+    for f in findings:
+        sev = f.get("severity", "low").lower()
+        if sev in by_severity:
+            by_severity[sev].append(f)
+
+    for sev in ["critical", "high", "medium", "low"]:
+        items = by_severity[sev]
+        if not items:
+            continue
+        new_content += f"## {sev.title()} Severity ({len(items)})\n\n"
+        for i, f in enumerate(items, 1):
+            title = f.get("title", "Untitled issue")
+            file_path = f.get("file", "")
+            line = f.get("line", 0)
+            desc = f.get("description", "")
+            rec = f.get("recommendation", "")
+            owasp = f.get("owasp_link", "")
+            standard = f.get("standard", "")
+            cat = f.get("category", "unknown")
+
+            location = f"{file_path}:{line}" if file_path and line else file_path or "Unknown location"
+            new_content += f"### {i}. {title}\n\n"
+            new_content += f"- **Location**: `{location}`\n"
+            new_content += f"- **Category**: {cat}\n"
+            if standard:
+                new_content += f"- **Standard**: {standard}\n"
+            elif owasp:
+                new_content += f"- **OWASP**: [{owasp}]({owasp})\n"
+            new_content += f"\n{desc}\n\n"
+            if rec:
+                new_content += f"**Recommendation**: {rec}\n\n"
+            new_content += "---\n\n"
+
+    new_content += "---\n\n*This audit used OWASP ASVS/MSVS standards fetched at audit time.*\n"
+
+    if issues_path.exists():
+        existing = issues_path.read_text(encoding="utf-8")
+        import re
+        pattern = r'\n*# Audit Findings\n.*'
+        preserved = re.sub(pattern, '', existing, flags=re.DOTALL)
+        if preserved.strip():
+            final_content = preserved.rstrip() + "\n\n" + new_content
+        else:
+            final_content = new_content
+    else:
+        final_content = new_content
+
+    issues_path.write_text(final_content, encoding="utf-8")
+
+
+def audit(prompt: str = ""):
+    """Run a security and complexity audit of the repository.
+
+    :param prompt: Additional audit focus instructions.
+    """
+
+    workspace = current_workspace().resolve()
+    if not workspace.is_dir():
+        abort(f"Workspace root is not a directory: {inline_code(workspace)}")
+    require_runtime(workspace)
+    chosen_model = current_model(None)
+
+    audit_prompt = "Conduct a comprehensive security and complexity audit of this repository."
+    if prompt:
+        audit_prompt += f"\n\nAdditional focus: {prompt}"
+    audit_prompt += "\n\nFetch current ASVS (Application Security Verification Standard) and MSVS (Mobile Security Verification Standard) via httpx. Explore the repository, identify security issues against ASVS/MSVS requirements, evaluate code complexity, and produce exactly 15 actionable findings with file/line references and standard references."
+
+    intro = [
+        "## Audit",
+        "",
+        f"- workspace: {inline_code(workspace)}",
+        f"- model: {inline_code(chosen_model)}",
+        f"- mode: {inline_code('non-interactive')}",
+        f"- focus: {inline_code(preview(audit_prompt, 100))}",
+    ]
+    markdown("\n".join(intro), stderr=True)
+
+    code, output = asyncio.run(
+        run_agent(
+            audit_prompt,
+            chosen_model,
+            workspace,
+            AUDIT_SYSTEM_PROMPT,
+            DEFAULT_MAX_STEPS,
+            DEFAULT_MAX_TOOL_CALLS,
+            interactive=False,
+        )
+    )
+
+    if code != 0:
+        return code
+
+    findings = parse_audit_findings(output)
+
+    if not findings:
+        warning("No valid findings JSON found in audit output.")
+        return 1
+
+    findings = findings[:15]
+    write_issues_file(workspace, findings)
+    status(f"Wrote {len(findings)} findings to ISSUES.md")
+
+    return 0
+
+
 def run(
     *prompt: str,
 ):
@@ -1732,7 +1896,7 @@ def model():
 
 def main(argv: list[str] | None = None):
     args = list(sys.argv[1:] if argv is None else argv)
-    commands = {"run", "models", "model", "-h", "--help"}
+    commands = {"run", "models", "model", "audit", "-h", "--help"}
     if not args:
         args = ["run"] if not sys.stdin.isatty() else ["--help"]
     elif args[0] in {"-v", "--version"}:
@@ -1740,7 +1904,7 @@ def main(argv: list[str] | None = None):
         return 0
     elif args[0] not in commands:
         args = ["run", *args]
-    result = defopt.run([run, models, model], argv=args, version=False, short={})
+    result = defopt.run([run, models, model, audit], argv=args, version=False, short={})
     return 0 if result is None else result
 
 

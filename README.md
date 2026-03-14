@@ -32,7 +32,7 @@ Most AI coding tools are large, complex, or lock you into specific providers. `o
 
 **Design goals:**
 - Small, auditable codebase
-- Minimal tool surface (7 tools)
+- Minimal tool surface (8 tools)
 - Works with OpenAI or AWS Bedrock
 - Fresh session each run (no hidden state)
 - Interactive checkpoints when you need them
@@ -41,68 +41,90 @@ Most AI coding tools are large, complex, or lock you into specific providers. `o
 
 | Tool | Purpose | When to Use |
 |------|---------|-------------|
-| `read` | Read files or directories | Always read before editing |
-| `apply` | Modify files (replace/write/move/delete) | All file modifications |
+| `read` | Read files/directories | Always read before editing |
+| `apply` | Modify files | All file edits (replace/write/move/delete) |
 | `list` | List directory contents | Exploring structure |
 | `glob` | Find files by pattern | Know the pattern, not the path |
 | `grep` | Search file contents | Find code by text/regex |
 | `bash` | Run shell commands | Builds, tests, git, package managers |
-| `httpx` | HTTP requests | Fetching pages, calling APIs |
-| `ask` | Ask user questions | Interactive checkpoints (TTY only) |
+| `httpx` | HTTP requests | Fetch docs, standards, API data |
+| `ask` | Ask user questions | Interactive checkpoints |
 
 ### Tool Details
 
 **read**: Primary inspection tool. Includes line numbers. Use `offset` and `limit` for large files. For directories, behaves like `list`.
 
-**apply**: All file modifications go through this tool. Operations:
-- `replace`: Exact string match replacement (read the file first!)
-- `write`: Create new files (`overwrite=true` to modify existing)
+**apply**: All file modifications. Operations:
+- `replace`: Exact string match (read the file first!)
+- `write`: Create files (`overwrite=true` to modify existing)
 - `move`: Rename files
 - `delete`: Remove files
 
-**grep**: Searches with ripgrep (preferred) or standard grep. Returns matching lines with file paths and line numbers. Use `file_glob` to filter by extension.
+**grep**: Ripgrep (preferred) or standard grep. Returns matching lines with file:line. Use `file_glob` to filter by extension.
 
 **httpx**: HTTP client with smart defaults:
-- `preset="page"`: Fetch HTML, auto-convert to markdown
-- `preset="json"`: API expecting JSON response
+- `preset="page"`: HTML→markdown conversion
+- `preset="json"`: API expecting JSON
 - `preset="post_json"`: POST with JSON body
 - `json_path`: Extract nested fields (e.g., `data.items.0.id`)
-- Sensitive headers (Authorization, etc.) are redacted in output
+- Sensitive headers redacted in output
 
-**bash**: For shell commands only. Not for reading files (use `read`) or searching (use `grep`). Output clips at ~16k chars, preserving both head and tail.
+**bash**: Shell commands only. Not for reading files (use `read`) or searching (use `grep`). Output clips at ~16k, preserving head and tail.
 
-**ask**: Interactive checkpoint tool. Use for plan approvals, ambiguous decisions, and commit offers. Only available in interactive mode (stdin is a TTY and `OY_NON_INTERACTIVE` is not set).
+**ask**: Interactive checkpoints. Use for plan approvals, ambiguous decisions, commit offers. Only available with TTY.
 
 ## Agent Behavior
 
-The system prompt guides the agent with specific behaviors:
-
 **Core workflow:**
 1. Inspect before changing (read files first)
-2. Use the narrowest tool that fits (grep → read → apply)
-3. Batch related operations (single `apply` for related edits)
-4. Fresh session each run (no hidden state or memory)
+2. Use the narrowest tool (grep → read → apply)
+3. Batch related operations (single `apply`)
+4. Fresh session each run (no hidden state)
 
-**Tool output truncation:**
+**Output truncation:**
 - Most tools: ~16k chars max
-- `bash`: preserves both head AND tail when clipped
+- `bash`: preserves head AND tail
 - `httpx`: ~20k chars
-- When clipped: agent narrows queries (read with offsets, specific grep) instead of guessing
+- When clipped: agent narrows queries instead of guessing
 
-**Interactive mode (`ask` enabled):**
-- Offers checkpoints for plans, risky changes, and multi-batch work
-- Asks to commit after making changes
-- Never asks after trivial steps—batches work meaningfully
+**Interactive mode:**
+- Checkpoints for plans, risky changes, multi-batch work
+- Asks to commit after changes
+- Batches work meaningfully
 
-**Non-interactive mode (`OY_NON_INTERACTIVE=1`):**
-- No checkpoints; runs to completion or blocking error
-- Recovers from failures automatically (retries, alternate tools, simpler approaches)
-- Provides clear status when blocked (what was tried, what remains, next step)
+**Non-interactive mode:**
+- No checkpoints; runs to completion
+- Auto-recovers from failures
+- Clear status when blocked
 
-**Safety:**
-- Asks before deleting files (interactive mode)
-- Offers to commit state before risky changes
-- Prefers safe, boring solutions over clever ones
+## Commands
+
+```bash
+oy "prompt"              # Run with a prompt (default)
+oy audit                  # Security audit against OWASP ASVS/MSVS
+oy audit "focus on auth"  # Audit with additional focus
+oy models                 # Interactive model picker
+oy models claude          # Filter models by name
+oy model                  # Show current default model
+oy --help                 # Show all commands
+oy --version              # Show version
+```
+
+## Audit Command
+
+The `oy audit` command runs a security and code quality audit:
+
+1. Fetches current OWASP ASVS/MSVS standards via httpx
+2. Explores the repository systematically
+3. Identifies issues against ASVS/MSVS requirements
+4. Evaluates code complexity
+5. Writes findings to `ISSUES.md`
+
+```bash
+oy audit                    # Full audit
+oy audit "focus on auth"    # With additional focus area
+OY_ROOT=./src oy audit      # Audit a specific directory
+```
 
 ## Configuration
 
@@ -175,17 +197,6 @@ oy "fix the bug in auth.py"
 # Or configure explicitly
 export AWS_PROFILE=my-profile
 export AWS_REGION=us-west-2
-```
-
-## Commands
-
-```bash
-oy "prompt"              # Run with a prompt (default subcommand)
-oy models                # Interactive model picker
-oy models claude         # Filter models by name
-oy model                 # Show current default model
-oy --help                # Show all commands
-oy --version             # Show version
 ```
 
 ## Troubleshooting
