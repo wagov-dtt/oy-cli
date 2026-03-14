@@ -26,6 +26,7 @@ from openai import (
     RateLimitError,
 )
 from rich.console import Console
+from rich import filesize
 from rich.markdown import Markdown
 from rich.prompt import Prompt
 from rich.status import Status
@@ -1344,11 +1345,10 @@ def session_size(session, kind: str) -> int:
 
 def format_size(chars: int) -> str:
     """Format character count as human-readable size."""
-    if chars < 1000:
-        return f"{chars} chars"
-    if chars < 1_000_000:
-        return f"{chars / 1000:.1f}k chars"
-    return f"{chars / 1_000_000:.1f}M chars"
+    result = filesize.decimal(chars)
+    if result.endswith(" bytes"):
+        return result.replace(" bytes", " chars")
+    return result.replace("B", " chars")
 
 
 def list_model_ids():
