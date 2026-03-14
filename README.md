@@ -13,22 +13,23 @@ Most AI coding tools are large, complex, or lock you into specific providers. `o
 
 ## Tools
 
-File operations: `read` `write` `edit` `patch` `list` `glob` `grep`  
+File operations: `read` `apply` `list` `glob` `grep`  
 Shell: `bash` (for builds, tests, git)  
-Network: `webfetch` (for docs, API lookups; HTML is compacted to markdown)  
+Network: `httpx` (for web pages and APIs; supports smart defaults, JSON bodies, filtering, and truncation)  
 Collaboration: `ask` (interactive runs only, for approvals, checkpoints, and feedback)
 
 ## Agent Notes
 
 - The built-in system prompt tells the agent to inspect before editing and prefer the narrowest tool that fits.
-- Tool output is clipped to keep long tasks inside model context. Most tool results are capped at about 16k chars, `bash` / unified `patch` keep both the start and end when clipped, and `webfetch` defaults to about 20k chars after HTML-to-markdown compaction.
+- Tool output is clipped to keep long tasks inside model context. Most tool results are capped at about 16k chars, `bash` keeps both the start and end when clipped, and `httpx` defaults to about 20k chars after response formatting.
 - Each `oy` run is a fresh session. It does not inject workspace history into later runs, so the agent should rely on the current prompt plus current tool results.
-- When output is clipped, the intended recovery path is to narrow the query: use `read` with offsets, `grep`, `glob`, `list`, or another focused `webfetch` instead of guessing.
+- When output is clipped, the intended recovery path is to narrow the query: use `read` with offsets, `grep`, `glob`, `list`, or another focused `httpx` call instead of guessing.
 - By default, interactive runs keep `ask` enabled and the system prompt encourages using it for plans, reviews, ambiguous product decisions, and meaningful checkpoints.
 - `OY_NON_INTERACTIVE=1` removes the `ask` tool from the run and swaps in a prompt that tells the agent to keep going without interruptions and recover from faults when it can.
 - For broad or risky changes, the prompt nudges the agent to ask whether it should summarise and commit the current state first so undo is easy.
 - Before ending with a normal completion summary after making changes, the prompt nudges the agent to ask whether it should summarise and commit the completed work.
-- `patch` supports both normal unified diffs and the friendlier file-oriented format starting with `*** Begin Patch`.
+- `apply` batches structured file operations for exact replacements, writes, moves, and deletes.
+- `httpx` can make authenticated HTTP requests, use `preset=json` or `preset=post_json` for common API calls, extract a `json_path`, and limit output with `max_chars`.
 
 ## Configuration
 
@@ -53,7 +54,7 @@ oy "fix the failing test"
 ## Requirements
 
 - Python 3.14+
-- `bash`, `patch`
+- `bash`
 - (Optional) `rg` (ripgrep) or `grep` for search support
 - OpenAI API key OR AWS CLI auth (for Bedrock)
 

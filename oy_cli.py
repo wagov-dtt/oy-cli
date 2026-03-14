@@ -10,7 +10,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -34,7 +33,7 @@ __version__ = "0.2.0"
 # Per-tool payloads should stay comfortable for long sessions on 128k-ish models.
 MAX_TOOL_OUTPUT_CHARS = 16000
 MAX_TOOL_OUTPUT_TAIL_CHARS = 4000
-MAX_WEBFETCH_CHARS = 20000
+MAX_HTTPX_CHARS = 20000
 DEFAULT_MODEL = "moonshotai.kimi-k2.5"
 DEFAULT_REGION = (
     os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
@@ -49,10 +48,10 @@ BASE_SYSTEM_PROMPT = (
     "Use workspace tools for files, use bash only for real terminal tasks, and read before editing. "
     "Each run is a single fresh session: do not assume hidden memory, saved history, or prior conversation state beyond the current prompt and tool results. "
     "If the user refers to earlier work and the needed context is missing, ask them to restate or paste the relevant context instead of guessing. "
-    "Tool output is clipped to keep long tasks inside model context. Most tool results are capped around 16k characters, bash and unified patch output keep both the start and end when clipped, and webfetch defaults to about 20k characters after HTML-to-markdown compaction. "
-    "When clipped output is not enough, narrow the request and keep going with read offsets, grep, glob, list, or follow-up webfetch calls instead of guessing. "
+    "Tool output is clipped to keep long tasks inside model context. Most tool results are capped around 16k characters, bash output keeps both the start and end when clipped, and httpx defaults to about 20k characters after response formatting. "
+    "When clipped output is not enough, narrow the request and keep going with read offsets, grep, glob, list, or follow-up httpx calls instead of guessing. "
     "Keep normal answers concise, but stay on task until you either finish the work or need human input; aim to complete as much useful work as possible in this session. "
-    "Prefer patch for larger coordinated edits or renames; it accepts standard unified diffs and a friendlier file-oriented format starting with '*** Begin Patch'."
+    "Use apply for exact replacements, full file writes, coordinated file changes, moves, or deletes."
 )
 INTERACTIVE_SYSTEM_PROMPT = (
     "This run is interactive. Use the ask tool for plans, reviews, ambiguity, meaningful checkpoints, tradeoffs, and collaborative iteration when a short back-and-forth will improve the result. "
@@ -113,11 +112,30 @@ SEARCH_BACKENDS = {
 }
 STR, INT, BOOL = {"type": "string"}, {"type": "integer"}, {"type": "boolean"}
 STRINGS = {"type": "array", "items": STR}
+APPLY_OPERATION = {
+    "type": "object",
+    "properties": {
+        "op": {"type": "string", "enum": ["replace", "write", "move", "delete"]},
+        "path": STR,
+        "old": STR,
+        "new": STR,
+        "replace_all": BOOL,
+        "content": STR,
+        "overwrite": BOOL,
+        "to": STR,
+    },
+    "required": ["op", "path"],
+}
+APPLY_OPERATIONS = {"type": "array", "items": APPLY_OPERATION}
 _using_bedrock = False
 _last_api_env_error = None
 STDOUT = Console()
 STDERR = Console(stderr=True)
 HTML_MARKERS = ("text/html", "application/xhtml+xml")
+HTTPX_PRESET = {"type": "string", "enum": ["page", "json", "post_json"]}
+HTTPX_RESPONSE_MODE = {"type": "string", "enum": ["auto", "headers", "body", "json"]}
+MAP = {"type": "object"}
+ANY_JSON = {}
 
 
 def markdown(text="", *, stderr=False):
@@ -211,7 +229,7 @@ def should_markdownify_html(content_type, text):
     )
 
 
-def webfetch_body(text, content_type):
+def format_http_text_body(text, content_type):
     if not should_markdownify_html(content_type, text):
         return text
     converted = compact_markdown(
@@ -223,6 +241,116 @@ def webfetch_body(text, content_type):
         )
     )
     return converted or text
+
+
+def parse_json_path(path):
+    return [part for part in (path or "").split(".") if part]
+
+
+def select_json_path(value, path):
+    current = value
+    for part in parse_json_path(path):
+        if isinstance(current, list):
+            if not part.isdigit():
+                raise ValueError(
+                    f"json_path expected list index, got {inline_code(part)}"
+                )
+            index = int(part)
+            try:
+                current = current[index]
+            except IndexError as exc:
+                raise ValueError(f"json_path index out of range: {index}") from exc
+            continue
+        if isinstance(current, dict):
+            if part not in current:
+                raise ValueError(f"json_path key not found: {inline_code(part)}")
+            current = current[part]
+            continue
+        raise ValueError(f"json_path cannot descend into {type(current).__name__}")
+    return current
+
+
+def normalize_mapping(value, name):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be an object")
+    return {str(key): "" if item is None else str(item) for key, item in value.items()}
+
+
+def is_json_content_type(content_type):
+    lowered = (content_type or "").lower()
+    return "application/json" in lowered or "+json" in lowered
+
+
+def render_json_value(value):
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=True, indent=2)
+
+
+def redact_header_value(name, value):
+    lowered = name.lower()
+    if lowered in {"authorization", "proxy-authorization", "cookie", "set-cookie"}:
+        return "<redacted>"
+    if any(marker in lowered for marker in ("token", "secret", "api-key", "apikey")):
+        return "<redacted>"
+    return value
+
+
+def render_response_headers(headers):
+    return "\n".join(
+        f"{name}: {redact_header_value(name, value)}" for name, value in headers.items()
+    )
+
+
+def httpx_error_message(exc, timeout_seconds):
+    message = str(exc).strip() or exc.__class__.__name__
+    lowered = message.lower()
+    if isinstance(exc, httpx.TimeoutException):
+        return f"request timed out after {timeout_seconds} seconds"
+    if "certificate verify failed" in lowered or "tls" in lowered:
+        return "TLS verification failed; check the certificate chain or use a trusted HTTPS endpoint"
+    if isinstance(exc, httpx.NetworkError):
+        return f"network error: {message}"
+    return f"request failed: {message}"
+
+
+def render_httpx_output(response, response_mode, json_path=None):
+    content_type = response.headers.get("content-type", "")
+    lines = [
+        f"url: {response.url}",
+        f"status: {response.status_code}",
+        f"reason: {response.reason_phrase}",
+        f"content-type: {content_type or '<unknown>'}",
+    ]
+    mode = response_mode
+    if mode == "auto":
+        mode = "json" if json_path or is_json_content_type(content_type) else "body"
+    if mode == "headers":
+        header_block = render_response_headers(response.headers)
+        lines.append("headers:")
+        lines.append(header_block or "<none>")
+        return "\n".join(lines)
+    if mode == "json":
+        try:
+            payload = response.json()
+        except json.JSONDecodeError as exc:
+            raise ValueError("response body is not valid JSON") from exc
+        else:
+            if json_path:
+                payload = select_json_path(payload, json_path)
+                lines.append(f"json-path: {json_path}")
+            lines.append("body-format: json")
+            lines.append("")
+            lines.append(render_json_value(payload))
+            return "\n".join(lines)
+    body = format_http_text_body(response.text, content_type)
+    if body != response.text:
+        lines.append("body-format: markdown")
+    lines.append("")
+    lines.append(body)
+    return "\n".join(lines)
 
 
 def show(text, lines=2):
@@ -573,7 +701,7 @@ def require_api_env(cwd=None):
 def require_runtime(cwd=None):
     require_api_env(cwd)
     env = command_env(cwd)
-    missing = [tool for tool in ("bash", "patch") if not which(tool, env.get("PATH"))]
+    missing = [tool for tool in ("bash",) if not which(tool, env.get("PATH"))]
     if missing:
         abort(
             "Required tools are missing.\n\n"
@@ -599,187 +727,18 @@ def resolve_path(root, raw):
     return path if path == root or root in path.parents else root / Path(raw).name
 
 
-def restore_text(lines, trailing_newline):
-    text = "\n".join(lines)
-    if trailing_newline and (lines or text == ""):
-        text += "\n"
-    return text
-
-
-def find_subsequence(lines, needle, start=0):
-    if not needle:
-        return start
-    end = len(lines) - len(needle) + 1
-    for index in range(max(start, 0), max(end, 0)):
-        if lines[index : index + len(needle)] == needle:
-            return index
-    return -1
-
-
-def locate_insertion_point(lines, locator, start=0):
-    marker = (locator or "").strip()
-    if not marker:
-        return min(max(start, 0), len(lines))
-    for index in range(max(start, 0), len(lines)):
-        if marker in lines[index]:
-            return index + 1
-    for index, line in enumerate(lines):
-        if marker in line:
-            return index + 1
-    return min(max(start, 0), len(lines))
-
-
-def parse_friendly_patch(patch_text):
-    lines = patch_text.strip("\n").splitlines()
-    if not lines or lines[0].strip() != "*** Begin Patch":
-        raise ValueError("friendly patch must start with '*** Begin Patch'")
-    operations, index, ended = [], 1, False
-    while index < len(lines):
-        line = lines[index]
-        if line.strip() == "*** End Patch":
-            ended = True
-            index += 1
-            break
-        if not line.strip():
-            index += 1
-            continue
-        if line.startswith("*** Add File: "):
-            path = line.removeprefix("*** Add File: ").strip()
-            index += 1
-            body = []
-            while index < len(lines) and not lines[index].startswith("*** "):
-                body.append(lines[index])
-                index += 1
-            operations.append(("add", path, None, body))
-            continue
-        if line.startswith("*** Delete File: "):
-            path = line.removeprefix("*** Delete File: ").strip()
-            operations.append(("delete", path, None, []))
-            index += 1
-            continue
-        if line.startswith("*** Update File: "):
-            path = line.removeprefix("*** Update File: ").strip()
-            index += 1
-            move_to = None
-            if index < len(lines) and lines[index].startswith("*** Move to: "):
-                move_to = lines[index].removeprefix("*** Move to: ").strip()
-                index += 1
-            body = []
-            while index < len(lines) and not lines[index].startswith("*** "):
-                body.append(lines[index])
-                index += 1
-            operations.append(("update", path, move_to, body))
-            continue
-        raise ValueError(f"unknown friendly patch header: {line}")
-    if not ended:
-        raise ValueError("friendly patch must end with '*** End Patch'")
-    if any(line.strip() for line in lines[index:]):
-        raise ValueError("unexpected content after '*** End Patch'")
-    return operations
-
-
-def render_added_file(body_lines):
-    content = []
-    for line in body_lines:
-        if not line.startswith("+"):
-            raise ValueError("added file content lines must start with '+'")
-        content.append(line[1:])
-    return "\n".join(content)
-
-
-def parse_update_hunks(body_lines):
-    if not body_lines:
-        return []
-    hunks, locator, chunk = [], "", []
-    for line in body_lines:
-        if line.startswith("@@"):
-            if chunk:
-                hunks.append((locator, chunk))
-                chunk = []
-            locator = line[2:].strip()
-            continue
-        if line[:1] not in {" ", "+", "-"}:
-            raise ValueError(
-                "update patch lines must start with '@@', ' ', '+', or '-'"
-            )
-        chunk.append(line)
-    if chunk:
-        hunks.append((locator, chunk))
-    return hunks
-
-
-def apply_update_patch(original_text, body_lines):
-    hunks = parse_update_hunks(body_lines)
-    if not hunks:
-        return original_text
-    lines = original_text.splitlines()
-    trailing_newline = original_text.endswith("\n")
-    cursor = 0
-    for locator, hunk_lines in hunks:
-        old_lines, new_lines = [], []
-        for line in hunk_lines:
-            prefix, content = line[:1], line[1:]
-            if prefix in {" ", "-"}:
-                old_lines.append(content)
-            if prefix in {" ", "+"}:
-                new_lines.append(content)
-        if old_lines:
-            start = find_subsequence(lines, old_lines, cursor)
-            if start < 0:
-                start = find_subsequence(lines, old_lines, 0)
-            if start < 0:
-                raise ValueError(
-                    "could not match patch hunk"
-                    + (f" near {inline_code(locator)}" if locator else "")
-                )
-            lines[start : start + len(old_lines)] = new_lines
-            cursor = start + len(new_lines)
-            continue
-        start = locate_insertion_point(lines, locator, cursor)
-        lines[start:start] = new_lines
-        cursor = start + len(new_lines)
-    return restore_text(lines, trailing_newline)
-
-
-def apply_friendly_patch(root, patch_text):
-    summaries = []
-    for kind, path, move_to, body_lines in parse_friendly_patch(patch_text):
-        target = resolve_path(root, path)
-        if kind == "add":
-            if target.exists():
-                raise ValueError(f"file already exists: {rel(root, target)}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(render_added_file(body_lines), encoding="utf-8")
-            summaries.append(f"added {rel(root, target)}")
-            continue
-        if kind == "delete":
-            if not target.exists():
-                raise ValueError(f"file does not exist: {rel(root, target)}")
-            if target.is_dir():
-                raise ValueError(
-                    f"cannot delete directory with patch: {rel(root, target)}"
-                )
-            target.unlink()
-            summaries.append(f"deleted {rel(root, target)}")
-            continue
-        if not target.exists():
-            raise ValueError(f"file does not exist: {rel(root, target)}")
-        if target.is_dir():
-            raise ValueError(f"cannot update directory with patch: {rel(root, target)}")
-        updated_text = apply_update_patch(
-            target.read_text(encoding="utf-8", errors="replace"), body_lines
+def apply_exact_replace(text, old, new, replace_all=False):
+    if not old:
+        raise ValueError("replace operation old must not be empty")
+    count = text.count(old)
+    if count == 0:
+        raise ValueError("replace target not found")
+    if count > 1 and not replace_all:
+        raise ValueError(
+            "replace target matched multiple locations; set replace_all=true"
         )
-        destination = target if move_to is None else resolve_path(root, move_to)
-        if destination != target and destination.exists():
-            raise ValueError(f"destination already exists: {rel(root, destination)}")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(updated_text, encoding="utf-8")
-        if destination != target:
-            target.unlink()
-            summaries.append(f"updated {rel(root, target)} -> {rel(root, destination)}")
-        else:
-            summaries.append(f"updated {rel(root, target)}")
-    return "\n".join(summaries)
+    updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
+    return updated, count
 
 
 def note_tool(state, name, **details):
@@ -835,79 +794,106 @@ def tool_read(state, path, offset=1, limit=200):
     )
 
 
-def tool_write(state, path, content):
-    note_tool(state, "write", path=path, chars=len(content))
-    target = resolve_path(state["root"], path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    text = f"wrote {rel(state['root'], target)} ({len(content)} chars)"
-    show(text, 1)
-    return text
-
-
-def tool_edit(state, path, old_text, new_text, replace_all=False):
-    note_tool(
-        state,
-        "edit",
-        path=path,
-        old_chars=len(old_text),
-        new_chars=len(new_text),
-        replace_all=replace_all,
-    )
-    if not old_text:
-        raise ValueError("old_text must not be empty")
-    target = resolve_path(state["root"], path)
-    text, count = target.read_text(encoding="utf-8", errors="replace"), 0
-    count = text.count(old_text)
-    if count == 0:
-        raise ValueError("old_text not found")
-    if count > 1 and not replace_all:
-        raise ValueError("old_text matched multiple locations; set replace_all=true")
-    target.write_text(
-        text.replace(old_text, new_text)
-        if replace_all
-        else text.replace(old_text, new_text, 1),
-        encoding="utf-8",
-    )
-    out = f"edited {rel(state['root'], target)} ({count} replacement{'s' if count != 1 else ''})"
-    show(out, 1)
-    return out
-
-
-def tool_patch(state, patch_text):
-    note_tool(state, "patch", chars=len(patch_text))
-    friendly = patch_text.lstrip().startswith("*** Begin Patch")
-    if friendly:
-        out = apply_friendly_patch(state["root"], patch_text)
-        show(out, 3)
-        return out
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
-        handle.write(patch_text)
-        patch_file = handle.name
-    try:
-        env = command_env(state["root"])
-        result = run_cmd(
-            [
-                which("patch", env.get("PATH")) or "patch",
-                "--strip=0",
-                "--directory",
-                str(state["root"]),
-                "--input",
-                patch_file,
-                "--forward",
-                "--batch",
-            ],
-            env=env,
+def tool_apply(state, operations):
+    if isinstance(operations, dict):
+        operations = [operations]
+    if not isinstance(operations, list) or not operations:
+        raise ValueError(
+            "operations must be a non-empty array or a single operation object"
         )
-    finally:
-        Path(patch_file).unlink(missing_ok=True)
-    out = clip(
-        f"exit_code: {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}".strip(),
-        tail_chars=MAX_TOOL_OUTPUT_TAIL_CHARS,
-    )
-    if result.returncode:
-        raise ValueError(out)
-    show(out, 1)
+    note_tool(state, "apply", operations=len(operations))
+    root = state["root"]
+    summaries = []
+    for index, operation in enumerate(operations, 1):
+        if not isinstance(operation, dict):
+            raise ValueError(f"operation {index} must be an object")
+        kind = operation.get("op")
+        path = operation.get("path")
+        if not isinstance(kind, str) or not kind:
+            raise ValueError(f"operation {index} is missing a valid op")
+        if not isinstance(path, str) or not path:
+            raise ValueError(f"operation {index} is missing a valid path")
+        target = resolve_path(root, path)
+        if kind == "replace":
+            old = operation.get("old")
+            new = operation.get("new")
+            replace_all = operation.get("replace_all", False)
+            if not isinstance(old, str) or not isinstance(new, str):
+                raise ValueError(
+                    f"replace operation {index} requires string old and new"
+                )
+            if not isinstance(replace_all, bool):
+                raise ValueError(
+                    f"replace operation {index} replace_all must be boolean"
+                )
+            if not target.exists():
+                raise ValueError(f"file does not exist: {rel(root, target)}")
+            if target.is_dir():
+                raise ValueError(
+                    f"cannot replace text in directory: {rel(root, target)}"
+                )
+            updated, count = apply_exact_replace(
+                target.read_text(encoding="utf-8", errors="replace"),
+                old,
+                new,
+                replace_all,
+            )
+            target.write_text(updated, encoding="utf-8")
+            summaries.append(
+                f"replaced {rel(root, target)} ({count} match{'es' if count != 1 else ''})"
+            )
+            continue
+        if kind == "write":
+            content = operation.get("content")
+            overwrite = operation.get("overwrite", False)
+            if not isinstance(content, str):
+                raise ValueError(f"write operation {index} requires string content")
+            if not isinstance(overwrite, bool):
+                raise ValueError(f"write operation {index} overwrite must be boolean")
+            if target.exists() and target.is_dir():
+                raise ValueError(f"cannot write directory: {rel(root, target)}")
+            if target.exists() and not overwrite:
+                raise ValueError(
+                    f"file already exists: {rel(root, target)}; set overwrite=true"
+                )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            summaries.append(f"wrote {rel(root, target)}")
+            continue
+        if kind == "move":
+            destination_raw = operation.get("to")
+            if not isinstance(destination_raw, str) or not destination_raw:
+                raise ValueError(f"move operation {index} requires a valid to path")
+            if not target.exists():
+                raise ValueError(f"file does not exist: {rel(root, target)}")
+            if target.is_dir():
+                raise ValueError(f"cannot move directory: {rel(root, target)}")
+            destination = resolve_path(root, destination_raw)
+            if destination == target:
+                raise ValueError(
+                    f"move destination matches source: {rel(root, target)}"
+                )
+            if destination.exists():
+                raise ValueError(
+                    f"destination already exists: {rel(root, destination)}"
+                )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            target.rename(destination)
+            summaries.append(f"moved {rel(root, target)} -> {rel(root, destination)}")
+            continue
+        if kind == "delete":
+            if not target.exists():
+                raise ValueError(f"file does not exist: {rel(root, target)}")
+            if target.is_dir():
+                raise ValueError(f"cannot delete directory: {rel(root, target)}")
+            target.unlink()
+            summaries.append(f"deleted {rel(root, target)}")
+            continue
+        raise ValueError(
+            f"operation {index} has unsupported op {inline_code(kind)}; use replace, write, move, or delete"
+        )
+    out = "\n".join(summaries)
+    show(out, 3)
     return out
 
 
@@ -930,10 +916,12 @@ def tool_bash(state, command, timeout_seconds=120):
 
 def tool_grep(state, pattern, path=".", file_glob=None):
     note_tool(state, "grep", pattern=pattern, path=path, glob=file_glob)
-    env, search_path = (
-        command_env(state["root"]),
-        str(resolve_path(state["root"], path)),
-    )
+    env, target = command_env(state["root"]), resolve_path(state["root"], path)
+    if not target.exists():
+        raise ValueError(f"search path does not exist: {rel(state['root'], target)}")
+    if target.is_file() and file_glob:
+        raise ValueError("file_glob only works when path is a directory")
+    search_path = str(target)
     for name, build in SEARCH_BACKENDS.items():
         if not (exe := which(name, env.get("PATH"))):
             continue
@@ -941,7 +929,10 @@ def tool_grep(state, pattern, path=".", file_glob=None):
             build(exe, pattern, search_path, file_glob), cwd=state["root"], env=env
         )
         if result.returncode not in (0, 1):
-            raise ValueError(result.stderr.strip() or f"{name} failed")
+            detail = result.stderr.strip() or result.stdout.strip() or f"{name} failed"
+            raise ValueError(
+                f"{name} search failed for {rel(state['root'], target)}: {detail}"
+            )
         out = result.stdout.strip() or "<no matches>"
         show(out, 3)
         return clip(out)
@@ -964,24 +955,87 @@ def tool_glob(state, pattern, path="."):
     return clip(out)
 
 
-def tool_webfetch(state, url, max_chars=MAX_WEBFETCH_CHARS):
-    note_tool(state, "webfetch", url=url, max_chars=max_chars)
+def tool_httpx(
+    state,
+    url,
+    preset=None,
+    method=None,
+    headers=None,
+    params=None,
+    body=None,
+    json_body=None,
+    timeout_seconds=20,
+    response_mode="auto",
+    json_path=None,
+    max_chars=MAX_HTTPX_CHARS,
+):
+    if preset is not None and preset not in HTTPX_PRESET["enum"]:
+        raise ValueError("preset must be one of page, json, or post_json")
+    if not isinstance(method, str) and method is not None:
+        raise ValueError("method must be a string")
+    method = (
+        (method or ("POST" if body is not None or json_body is not None else "GET"))
+        .strip()
+        .upper()
+    )
+    if preset == "post_json" and method == "GET":
+        method = "POST"
+    if response_mode == "auto" and preset in {"json", "post_json"}:
+        response_mode = "json"
+    elif response_mode == "body" and json_path:
+        response_mode = "json"
+    note_tool(
+        state,
+        "httpx",
+        preset=preset,
+        method=method,
+        url=url,
+        response_mode=response_mode,
+        json_path=json_path,
+        timeout=timeout_seconds,
+        max_chars=max_chars,
+    )
     parsed = urlparse(url if "://" in url else f"https://{url}")
     if parsed.scheme not in {"http", "https"}:
-        raise ValueError("webfetch only supports http and https")
-    status("Fetching web content.")
-    with httpx.Client(follow_redirects=True, timeout=20.0) as http:
-        response = http.get(parsed.geturl())
-        response.raise_for_status()
-    content_type = response.headers.get("content-type", "")
-    body = webfetch_body(response.text, content_type)
-    out = (
-        f"url: {response.url}\n"
-        f"status: {response.status_code}\n"
-        f"content-type: {content_type}\n"
-        + ("content-format: markdown\n" if body != response.text else "")
-        + f"\n{body}"
-    )
+        raise ValueError("httpx only supports http and https")
+    if body is not None and json_body is not None:
+        raise ValueError("provide either body or json_body, not both")
+    if not method:
+        raise ValueError("method must be a non-empty string")
+    if not isinstance(timeout_seconds, int) or timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be a positive integer")
+    if not isinstance(max_chars, int) or max_chars <= 0:
+        raise ValueError("max_chars must be a positive integer")
+    if response_mode not in HTTPX_RESPONSE_MODE["enum"]:
+        raise ValueError("response_mode must be one of auto, headers, body, or json")
+    if json_path is not None and not isinstance(json_path, str):
+        raise ValueError("json_path must be a string")
+    if response_mode == "headers" and json_path:
+        raise ValueError("json_path requires body or json output")
+    if body is not None and not isinstance(body, str):
+        raise ValueError("body must be a string")
+    if json_body is not None and not isinstance(
+        json_body, (dict, list, str, int, float, bool)
+    ):
+        raise ValueError("json_body must be valid JSON-like data")
+    request_headers = normalize_mapping(headers, "headers")
+    request_params = normalize_mapping(params, "params")
+    status("Fetching HTTP content.")
+    try:
+        with httpx.Client(
+            follow_redirects=True, timeout=float(timeout_seconds)
+        ) as http:
+            response = http.request(
+                method,
+                parsed.geturl(),
+                headers=request_headers,
+                params=request_params,
+                content=body,
+                json=json_body,
+            )
+    except httpx.HTTPError as exc:
+        raise ValueError(httpx_error_message(exc, timeout_seconds)) from exc
+    out = render_httpx_output(response, response_mode, json_path=json_path)
     show(out, 1)
     return clip(out, max_chars)
 
@@ -1010,23 +1064,11 @@ def tool_ask(state, question, choices=None):
 
 
 TOOL_SPECS = {
-    "write": (
-        tool_write,
-        "Create or overwrite a workspace file. Prefer edit for exact replacements and patch for larger coordinated changes.",
-        {"path": STR, "content": STR},
-        ["path", "content"],
-    ),
-    "edit": (
-        tool_edit,
-        "Replace exact text in an existing workspace file. Use this when you know the current text to swap.",
-        {"path": STR, "old_text": STR, "new_text": STR, "replace_all": BOOL},
-        ["path", "old_text", "new_text"],
-    ),
-    "patch": (
-        tool_patch,
-        "Apply coordinated file edits inside the workspace. Accepts standard unified diffs and a friendlier file-oriented format starting with '*** Begin Patch'.",
-        {"patch_text": STR},
-        ["patch_text"],
+    "apply": (
+        tool_apply,
+        "Apply one or more structured file operations inside the workspace. Supports exact replacements, writes, moves, and deletes.",
+        {"operations": APPLY_OPERATIONS},
+        ["operations"],
     ),
     "list": (
         tool_list,
@@ -1058,10 +1100,22 @@ TOOL_SPECS = {
         {"pattern": STR, "path": STR},
         ["pattern"],
     ),
-    "webfetch": (
-        tool_webfetch,
-        "Fetch a web page over HTTP or HTTPS. HTML pages are converted to markdown before truncation, with a default budget of about 20k chars.",
-        {"url": STR, "max_chars": INT},
+    "httpx": (
+        tool_httpx,
+        "Fetch a page or call an API. Smart defaults infer GET vs POST and text vs JSON; use preset for common cases.",
+        {
+            "url": STR,
+            "preset": HTTPX_PRESET,
+            "method": STR,
+            "headers": MAP,
+            "params": MAP,
+            "body": STR,
+            "json_body": ANY_JSON,
+            "timeout_seconds": INT,
+            "response_mode": HTTPX_RESPONSE_MODE,
+            "json_path": STR,
+            "max_chars": INT,
+        },
         ["url"],
     ),
     "ask": (
