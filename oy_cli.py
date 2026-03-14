@@ -27,8 +27,8 @@ from openai import (
 )
 from rich.console import Console
 from rich.markdown import Markdown
-
 from rich.prompt import Prompt
+from rich.status import Status
 
 __version__ = "0.2.0"
 # Per-tool payloads should stay comfortable for long sessions on 128k-ish models.
@@ -1305,6 +1305,52 @@ def run_tool(state, tool_name, tool_args):
         return f"Error in {name}: {type(exc).__name__}: {exc}"
 
 
+def message_size(msg) -> int:
+    """Calculate the approximate character size of a message."""
+    if isinstance(msg, dict):
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return len(content)
+        if isinstance(content, list):
+            # For multimodal content, sum text lengths
+            total = 0
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        total += len(item.get("text", ""))
+                    elif item.get("type") == "image_url":
+                        # Base64 images are usually large, estimate from URL data
+                        url_data = item.get("image_url", {}).get("url", "")
+                        if url_data.startswith("data:"):
+                            total += len(url_data.split(",", 1)[-1])
+                        else:
+                            total += len(url_data)
+                    else:
+                        total += len(json.dumps(item))
+                else:
+                    total += len(str(item))
+            return total
+        return len(json.dumps(content, ensure_ascii=True))
+    return len(str(msg))
+
+
+def session_size(session, kind: str) -> int:
+    """Calculate total size of messages in a session."""
+    if kind == "chat":
+        return sum(message_size(msg) for msg in cast(list, session))
+    # responses mode
+    return sum(message_size(msg) for msg in cast(dict, session).get("input", []))
+
+
+def format_size(chars: int) -> str:
+    """Format character count as human-readable size."""
+    if chars < 1000:
+        return f"{chars} chars"
+    if chars < 1_000_000:
+        return f"{chars / 1000:.1f}k chars"
+    return f"{chars / 1_000_000:.1f}M chars"
+
+
 def list_model_ids():
     require_api_env()
     status("Loading available models.")
@@ -1324,14 +1370,40 @@ async def run_turn(
     allow_fallback=False,
 ):
     for _ in range(max_steps):
-        status(f"Waiting for {inline_code(model)}.")
+        size = session_size(session, kind)
+        size_str = format_size(size)
+        spinner = Status(
+            f"Waiting for {model} · {size_str}",
+            console=STDERR,
+            spinner="dots",
+        )
+        spinner.start()
+        try:
+            if kind == "chat":
+                response = await cast(AsyncOpenAI, client).chat.completions.create(
+                    model=model,
+                    messages=session,
+                    tools=chat_tool_defs,
+                    tool_choice="auto",
+                )  # type: ignore[arg-type]
+            else:
+                try:
+                    response = await cast(AsyncOpenAI, client).responses.create(
+                        model=model,
+                        instructions=system_prompt,
+                        input=session["input"],
+                        tools=responses_tool_defs,
+                        tool_choice="auto",
+                    )  # type: ignore[arg-type]
+                except Exception as exc:
+                    reason = responses_fallback_reason(exc)
+                    if allow_fallback and not session["tool_used"] and reason:
+                        raise ResponsesFallback(reason) from exc
+                    raise
+        finally:
+            spinner.stop()
+        # Process response after spinner has stopped
         if kind == "chat":
-            response = await cast(AsyncOpenAI, client).chat.completions.create(
-                model=model,
-                messages=session,
-                tools=chat_tool_defs,
-                tool_choice="auto",
-            )  # type: ignore[arg-type]
             message = response.choices[0].message.model_dump(exclude_none=True)
             calls = []
             for call in message.get("tool_calls") or []:
@@ -1350,19 +1422,6 @@ async def run_turn(
             if calls:
                 session.append(message)
         else:
-            try:
-                response = await cast(AsyncOpenAI, client).responses.create(
-                    model=model,
-                    instructions=system_prompt,
-                    input=session["input"],
-                    tools=responses_tool_defs,
-                    tool_choice="auto",
-                )  # type: ignore[arg-type]
-            except Exception as exc:
-                reason = responses_fallback_reason(exc)
-                if allow_fallback and not session["tool_used"] and reason:
-                    raise ResponsesFallback(reason) from exc
-                raise
             calls, output = [], response.output_text or ""
             for item in cast(Any, response.output):
                 if getattr(item, "type", None) == "message":
