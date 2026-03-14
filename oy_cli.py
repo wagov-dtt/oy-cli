@@ -646,8 +646,34 @@ def setting(choice, env_keys, config_key, default):
     return load_config().get(config_key, default) if config_key else default
 
 
+def find_model_by_suffix(models, suffix):
+    """Return first model ID ending with suffix, or None."""
+    for m in models:
+        if m.endswith(suffix):
+            return m
+    return None
+
+
+def pick_default_model():
+    """Try glm-5 then kimi-k2.5 via suffix match on available models."""
+    try:
+        available = list_model_ids()
+    except Exception:
+        return DEFAULT_MODEL
+    for suffix in ("glm-5", "kimi-k2.5"):
+        if m := find_model_by_suffix(available, suffix):
+            return m
+    return DEFAULT_MODEL
+
+
 def current_model(choice):
-    return setting(choice, ("OY_MODEL",), "model", DEFAULT_MODEL)
+    if choice:
+        return choice
+    if os.environ.get("OY_MODEL"):
+        return os.environ["OY_MODEL"]
+    if model := load_config().get("model"):
+        return model
+    return pick_default_model()
 
 
 def current_region(choice):
