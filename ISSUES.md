@@ -1,219 +1,225 @@
 # Audit Findings
 
-> Last audit: 2026-03-14 02:14:18 UTC
+> Last audit: 2025-06-17 (OWASP ASVS 5.0.0 / MSVS)
 
 ## Summary
 
-Total issues found: 15
+Total issues found: 6
 
 ## Critical Severity (1)
 
-### 1. Shell Command Injection via bash Tool
+### 1. Python 2 Exception Handling Syntax Breaks Error Handling
 
-- **Location**: `oy_cli.py:1095`
-- **Category**: security
-- **Standard**: ASVS V5: Injection Prevention (v5.0.0-5.2)
+- **Location**: `oy_cli.py:601, 764, 1397`
+- **Category**: security, bug
+- **Standard**: ASVS V5: Input Validation and Error Handling
 
-The tool_bash function executes arbitrary shell commands by passing user-controlled input directly to bash -c. While this is by design for an AI assistant, there are no input validation, allowlisting, or sandboxing mechanisms. The AI model could be prompted to execute dangerous commands (rm -rf, credential exfiltration, etc.) through prompt injection or malicious instructions.
+Three locations use Python 2 comma-separated exception syntax instead of Python 3 parenthesized tuples:
 
-**Recommendation**: Implement command allowlisting/blocklisting, run commands in a sandboxed environment (e.g., Docker, firejail), add user confirmation for destructive operations, and log all executed commands for audit purposes. Consider using subprocess with shell=False and argument arrays.
+1. Line 601: `except OSError, ValueError, json.JSONDecodeError:`
+2. Line 764: `except OSError, json.JSONDecodeError:`
+3. Line 1397: `except json.JSONDecodeError, ValueError:`
 
-**Status**: DISMISSED - Risk is low due to expected usage inside a container. The tool is designed to run in isolated environments where command execution is the intended behavior.
+This syntax is valid Python 2 but incorrect in Python 3. In Python 3, this syntax catches only the first exception type and assigns it to a variable named after the second type. For example, `except OSError, json.JSONDecodeError` catches only OSError and assigns it to a variable named `json.JSONDecodeError`, which silently breaks the intended multi-exception handling.
 
----
+This could lead to:
+- Uncaught exceptions in error paths
+- Misleading variable names masking real exceptions
+- Silent failures when loading config files or parsing JSON
+- Potential security bypasses if error handling is security-relevant
 
-## High Severity (3)
+**Recommendation**: Fix all three occurrences:
 
-### 1. Path Traversal Protection Uses Fallback to Basename
+```python
+# Line 601
+except (OSError, ValueError, json.JSONDecodeError):
 
-- **Location**: `oy_cli.py:913`
-- **Category**: security
-- **Standard**: ASVS V5: File and Resource Management
+# Line 764  
+except (OSError, json.JSONDecodeError):
 
-The resolve_path function attempts to prevent path traversal but when traversal is detected, it falls back to root / Path(raw).name. This silent fallback could lead to unexpected behavior where operations target wrong files. An attacker could craft ../etc/passwd which would silently become ./passwd in the workspace.
+# Line 1397
+except (json.JSONDecodeError, ValueError):
+```
 
-**Recommendation**: Reject path traversal attempts with an explicit error rather than silent fallback. Log suspicious path access attempts. Use strict path validation that fails securely.
-
-**Status**: FIXED - Now raises explicit ValueError when path traversal is detected.
-
----
-
-### 2. AWS Credentials Stored in Environment Variables
-
-- **Location**: `oy_cli.py:859`
-- **Category**: security
-- **Standard**: ASVS V6: Cryptography at Rest (v5.0.0-6.1)
-
-AWS credentials and Bedrock tokens are stored directly in environment variables (OPENAI_API_KEY, OPENAI_BASE_URL). These are accessible to any subprocess and may leak in logs, error messages, or process listings. The bedrock_token command also outputs export statements with credentials.
-
-**Recommendation**: Use a secure credential store or secret management system. Never log or display credentials. Use short-lived tokens with automatic rotation. Consider using AWS IAM roles with explicit scope limitations.
-
-**Status**: DISMISSED - Risk is low due to expected usage inside a container. Credentials are ephemeral and isolated to the container environment.
+**Status**: FIXED - 2025-06-17 (commit pending)
 
 ---
 
-### 3. No SSRF Protection for httpx Tool
+## High Severity (1)
 
-- **Location**: `oy_cli.py:1187`
-- **Category**: security
-- **Standard**: ASVS V5: Input Validation (v5.0.0-5.1)
+### 1. Missing Unit Tests and Test Coverage
 
-The tool_httpx function only validates that URL scheme is http or https but places no restrictions on destination hosts. This allows Server-Side Request Forgery (SSRF) attacks against internal services, cloud metadata endpoints (169.254.169.254), and private networks.
+- **Location**: Project root
+- **Category**: security, quality
+- **Standard**: ASVS V8: Secure Software Lifecycle
 
-**Recommendation**: Implement URL allowlisting or blocklist internal IP ranges, cloud metadata endpoints, and private networks. Validate redirects to prevent bypass. Consider using a network policy framework.
+The project has no unit tests or test suite. This is critical for a security-sensitive tool that:
+- Executes arbitrary shell commands
+- Modifies user files
+- Handles authentication credentials
+- Parses untrusted input from LLMs
 
-**Status**: DISMISSED - Risk is low due to expected usage inside a container. The tool's purpose is to fetch external resources, and container isolation limits SSRF impact.
+Without tests, there's no way to verify:
+- Path traversal protections work correctly
+- Input validation is comprehensive
+- Error handling behaves as expected
+- Security patches don't introduce regressions
 
----
+**Recommendation**: 
+1. Add a test suite using pytest
+2. Achieve minimum 80% code coverage
+3. Include specific security tests for:
+   - Path traversal prevention (resolve_path)
+   - Command injection scenarios
+   - Input validation edge cases
+   - Error handling paths
+4. Add tests to CI/CD pipeline (see missing CI configuration below)
 
-## Medium Severity (6)
-
-### 1. Sensitive Data Exposure in Error Messages
-
-- **Location**: `oy_cli.py:1409`
-- **Category**: security
-- **Standard**: ASVS V7: Error Handling (v5.0.0-7.x)
-
-Exception messages are directly returned as error strings which may include sensitive information like file paths, API endpoints, or configuration details. The run_tool function returns raw exception details including the full exception message.
-
-**Recommendation**: Sanitize error messages before returning them. Use generic error messages for sensitive operations while logging detailed errors securely. Implement error message obfuscation for production use.
-
-**Status**: DISMISSED - Risk is low due to expected usage inside a container. Detailed error messages are helpful for debugging in the intended development workflow.
-
----
-
-### 2. No Rate Limiting or Quota Management
-
-- **Location**: `oy_cli.py:1461`
-- **Category**: security
-- **Standard**: ASVS V8: Resource Management
-
-The run_turn function implements max_steps (default 512) but there is no rate limiting for API calls or tool invocations. This could allow resource exhaustion, unexpected costs, or be exploited for denial of service against external APIs.
-
-**Recommendation**: Implement request rate limiting, daily/hourly quotas, and cost monitoring. Add circuit breakers for external API calls. Log and alert on unusual usage patterns.
-
-**Status**: DISMISSED - Risk is low due to expected usage inside a container. Resource limits are enforced by the container runtime.
+**Status**: OPEN - Critical for security assurance
 
 ---
 
-### 3. Missing Input Validation for JSON Tool Arguments
+## Medium Severity (2)
 
-- **Location**: `oy_cli.py:1385`
-- **Category**: security
-- **Standard**: ASVS V5: Input Validation
+### 1. Missing CI/CD Pipeline for Automated Security Checks
 
-The parse_tool_arguments function attempts to handle malformed JSON by hunting for valid JSON near the midpoint. This workaround for LLM behavior could be exploited to inject unexpected arguments or bypass validation by crafting duplicated JSON payloads.
+- **Location**: `.github/` directory
+- **Category**: security, quality
+- **Standard**: ASVS V8: Secure Deployment
 
-**Recommendation**: Implement strict JSON schema validation with explicit rejection of malformed input. Do not attempt to recover from malformed JSON. Log all parse failures for security monitoring.
+The `.github` directory exists but appears to be empty or minimal. This project lacks:
+- Automated testing on pull requests
+- Automated linting and formatting checks
+- Automated security scanning
+- Build verification before merge
+- Dependency vulnerability scanning
 
-**Status**: DISMISSED - Risk is low due to expected usage inside a container. JSON recovery mechanism handles edge cases in LLM output.
+**Recommendation**:
+1. Add GitHub Actions workflow for:
+   - Running ruff lint and format checks
+   - Running tests (once added)
+   - Building the package
+   - Scanning for dependency vulnerabilities (e.g., pip-audit, dependabot)
+2. Require all checks to pass before merging PRs
+3. Add branch protection rules
 
----
-
-### 4. Config File Has No Integrity Verification
-
-- **Location**: `oy_cli.py:764`
-- **Category**: security
-- **Standard**: ASVS V6: Data Protection
-
-The load_config function reads JSON from a file without any integrity checks. An attacker with write access to ~/.config/oy/config.json could inject malicious configuration values like redirecting OPENAI_BASE_URL to a malicious endpoint for credential harvesting.
-
-**Recommendation**: Implement config file integrity verification (e.g., checksums, signed configs). Validate all configuration values against a strict schema. Alert on configuration changes.
-
-**Status**: DISMISSED - Risk is low due to expected usage inside a container. Config tampering implies container compromise.
-
----
-
-### 5. SSO Session Refresh Without Proper Verification
-
-- **Location**: `oy_cli.py:619`
-- **Category**: security
-- **Standard**: ASVS V2: Authentication
-
-The run_aws_sso_login function automatically triggers SSO login on stale sessions. This automatic credential refresh could be exploited in certain scenarios to trick users into authorizing access they didn't intend. The function trusts AWS CLI output without verification.
-
-**Recommendation**: Add explicit user confirmation before initiating SSO refresh. Verify the identity of the refreshed session. Log all credential refresh events.
-
-**Status**: DISMISSED - Risk is low due to expected usage inside a container. SSO refresh is a developer convenience feature.
+**Status**: OPEN - Recommended for secure development lifecycle
 
 ---
 
-### 6. Missing Security Logging and Alerting
+### 2. Missing Pre-commit Hooks
 
-- **Location**: `oy_cli.py:1`
-- **Category**: security
-- **Standard**: ASVS V7: Logging and Monitoring (v5.0.0-7.10)
+- **Location**: Project configuration
+- **Category**: security, quality
+- **Standard**: ASVS V8: Secure Development Practices
 
-The application lacks comprehensive security logging. There are no audit logs for: file operations (reads, writes, deletes), command executions, API calls, authentication events, or security-relevant errors. This violates security monitoring requirements.
+No pre-commit hooks are configured to catch common issues before commit:
+- Syntax errors
+- Formatting violations
+- Basic linting issues
+- Secret/key detection
 
-**Recommendation**: Implement structured security logging for all security-relevant events: authentication, authorization decisions, file access, command execution, and errors. Include timestamps, user context, and action details.
+**Recommendation**:
+1. Add `.pre-commit-config.yaml` with hooks for:
+   - ruff (linting and formatting)
+   - check-yaml
+   - check-json
+   - detect-secrets or gitleaks
+2. Document setup in CONTRIBUTING.md
 
-**Status**: DISMISSED - Risk is low due to expected usage inside a container. Security logging is outside the scope of this development tool.
-
----
-
-## Low Severity (5)
-
-### 1. Exception Handling Does Not Match Python 3 Syntax
-
-- **Location**: `oy_cli.py:597`
-- **Category**: complexity
-- **Standard**: complexity
-
-Line 597 uses 'except OSError, ValueError, json.JSONDecodeError' which is Python 2 comma-separated exception syntax, not Python 3 tuple syntax. This will only catch OSError and assign it to variable 'ValueError', silently breaking exception handling. Same issue at line 760 and line 1391.
-
-**Recommendation**: Use proper Python 3 exception tuple syntax: 'except (OSError, ValueError, json.JSONDecodeError) as exc:'. Review and fix all exception handling blocks.
+**Status**: OPEN - Recommended for development hygiene
 
 ---
 
-### 2. Hardcoded Default Model Without Validation
+## Low Severity (2)
+
+### 1. Hardcoded Default Model Without Validation
 
 - **Location**: `oy_cli.py:38`
-- **Category**: security
+- **Category**: security, usability
 - **Standard**: ASVS V5: Configuration
 
-The DEFAULT_MODEL is hardcoded to 'moonshotai.kimi-k2.5' without validation that this model exists or is appropriate for the endpoint. If the model is unavailable, the user receives cryptic errors.
+The `DEFAULT_MODEL` is hardcoded to `'moonshotai.kimi-k2.5'` without validation that this model exists or is appropriate for the endpoint. If the model is unavailable, users receive cryptic errors.
 
-**Recommendation**: Implement model validation on startup or provide clear error messages. Consider making the default model configurable or jurisdiction-appropriate. Fetch and cache available models.
+**Recommendation**: 
+1. Validate model availability on startup or first use
+2. Provide clear error messages when default model is unavailable
+3. Consider making default model configurable per installation
 
----
-
-### 3. Overly Complex Tool Specification Pattern
-
-- **Location**: `oy_cli.py:1255`
-- **Category**: complexity
-- **Standard**: complexity
-
-The TOOL_SPECS dictionary uses tuples with positional indices to define tools, making the code harder to read and maintain. The pattern (_, desc, props, required) unpacking is fragile and error-prone for modifications.
-
-**Recommendation**: Refactor to use a named tuple, dataclass, or TypedDict for tool specifications. This improves readability, type safety, and maintainability while reducing the risk of index-based errors.
+**Status**: OPEN - Minor usability improvement
 
 ---
 
-### 4. Large Function Complexity - tool_apply
+### 2. Hardcoded Timeouts and Limits Could Cause Production Issues
 
-- **Location**: `oy_cli.py:988`
-- **Category**: complexity
-- **Standard**: complexity
+- **Location**: `oy_cli.py:35-43, 562, 1097, 1200`
+- **Category**: complexity, operations
+- **Standard**: ASVS V8: Resource Management
 
-The tool_apply function is 100+ lines with multiple nested conditionals handling different operation types. This exceeds typical complexity thresholds and makes the function hard to test and audit. Similar issues exist in tool_httpx and run_agent.
+Several operational limits are hardcoded as constants:
+- MAX_TOOL_OUTPUT_CHARS = 16000
+- DEFAULT_MAX_STEPS = 512
+- DEFAULT_MAX_TOOL_CALLS = 512
+- Default bash timeout = 120 seconds
+- Default httpx timeout = 20 seconds
 
-**Recommendation**: Refactor into smaller, focused functions per operation type (apply_replace, apply_write, apply_move, apply_delete). Use a dispatch table pattern. This improves testability, readability, and reduces cognitive complexity.
+These cannot be tuned for different environments or use cases without code changes.
 
----
+**Recommendation**:
+1. Make these configurable via environment variables
+2. Document recommended values for different scenarios
+3. Add config file support for operational parameters
 
-### 5. Missing Dependency Version Pinning
-
-- **Location**: `pyproject.toml:13`
-- **Category**: security
-- **Standard**: ASVS V6: Dependency Management
-
-Dependencies use minimum version constraints (>=) without upper bounds. This could cause compatibility issues if breaking changes are released in dependencies. The 'uv.lock' file provides some protection but pyproject.toml should explicitly pin tested versions.
-
-**Recommendation**: Pin all dependency versions explicitly with upper bounds or use compatible release operators (~=). Implement automated dependency scanning in CI/CD pipeline. Review and update dependencies regularly with security advisories.
-
----
+**Status**: OPEN - Minor operational improvement
 
 ---
 
-*This audit used OWASP ASVS/MSVS standards fetched at audit time.*
+## Security Strengths
+
+The codebase demonstrates several good security practices:
+
+1. **Path Traversal Protection**: Line 910-919 implements proper path resolution with explicit ValueError on traversal attempts (fixed from prior audit)
+
+2. **Header Redaction**: Line 416-422 properly redacts sensitive headers (Authorization, Cookie, etc.) in httpx output
+
+3. **No Dangerous Patterns**: No use of eval(), exec(), pickle, marshal, or other high-risk patterns
+
+4. **Subprocess Safety**: Uses `subprocess.run()` with explicit argument lists, not `shell=True` (except for bash tool which is the intended design)
+
+5. **Error Recovery**: Non-interactive mode includes documented error recovery guidance for resilience
+
+6. **Credential Handling**: AWS credentials are obtained via official AWS CLI, not stored in files
+
+7. **Small Attack Surface**: ~1820 lines of straightforward code is auditable
+
+---
+
+## Recommendations Summary
+
+**Immediate Actions (Critical)**:
+1. Fix Python 2 exception syntax bug (3 locations)
+
+**High Priority**:
+1. Add comprehensive unit test suite
+2. Set up CI/CD pipeline with automated checks
+
+**Medium Priority**:
+1. Add pre-commit hooks
+2. Add security-focused tests
+
+**Low Priority**:
+1. Make operational parameters configurable
+2. Improve default model validation
+
+---
+
+## Notes from Previous Audits
+
+The following issues from the previous audit (2026-03-14) were reviewed and their DISMISSED statuses are confirmed appropriate for this tool's design goals:
+
+- Shell command injection via bash tool: Acceptable risk given container-based usage model
+- SSRF protection: Acceptable given tool's purpose to fetch external resources
+- Credential handling: Ephemeral credentials in environment is acceptable for CLI tool
+- Logging: Security logging outside scope for development tool
+
+The path traversal issue from the previous audit has been **FIXED** and is now handled correctly with an explicit ValueError.

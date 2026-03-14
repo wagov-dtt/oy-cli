@@ -30,7 +30,7 @@ from rich.markdown import Markdown
 from rich.prompt import Prompt
 from rich.status import Status
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 # Per-tool payloads should stay comfortable for long sessions on 128k-ish models.
 MAX_TOOL_OUTPUT_CHARS = 16000
 MAX_TOOL_OUTPUT_TAIL_CHARS = 4000
@@ -598,7 +598,7 @@ def command_env(cwd=None):
             timeout=5,
         )
         data = json.loads(result.stdout) if result.returncode == 0 else {}
-    except OSError, ValueError, json.JSONDecodeError:
+    except (OSError, ValueError, json.JSONDecodeError):
         return env
     if not isinstance(data, dict):
         return env
@@ -761,7 +761,7 @@ def config_path():
 def load_json(path, default):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except OSError, json.JSONDecodeError:
+    except (OSError, json.JSONDecodeError):
         return default
 
 
@@ -1394,7 +1394,7 @@ def parse_tool_arguments(args_str: str) -> dict[str, Any]:
             if args_str[i] == "{":
                 try:
                     return decode(args_str[i:])
-                except json.JSONDecodeError, ValueError:
+                except (json.JSONDecodeError, ValueError):
                     pass
         raise exc
 
