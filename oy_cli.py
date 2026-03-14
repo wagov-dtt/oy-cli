@@ -42,33 +42,96 @@ DEFAULT_REGION = (
 DEFAULT_MAX_STEPS = 512
 DEFAULT_MAX_TOOL_CALLS = 512
 CONFIG_PATH = Path.home() / ".config" / "oy" / "config.json"
-BASE_SYSTEM_PROMPT = (
-    "You are oy, a tiny local coding assistant. "
-    "Work simply, inspect before changing, and prefer secure boring solutions. "
-    "Use workspace tools for files, use bash only for real terminal tasks, and read before editing. "
-    "Each run is a single fresh session: do not assume hidden memory, saved history, or prior conversation state beyond the current prompt and tool results. "
-    "If the user refers to earlier work and the needed context is missing, ask them to restate or paste the relevant context instead of guessing. "
-    "Tool output is clipped to keep long tasks inside model context. Most tool results are capped around 16k characters, bash output keeps both the start and end when clipped, and httpx defaults to about 20k characters after response formatting. "
-    "When clipped output is not enough, narrow the request and keep going with read offsets, grep, glob, list, or follow-up httpx calls instead of guessing. "
-    "Keep normal answers concise, but stay on task until you either finish the work or need human input; aim to complete as much useful work as possible in this session. "
-    "Use apply for exact replacements, full file writes, coordinated file changes, moves, or deletes."
-)
-INTERACTIVE_SYSTEM_PROMPT = (
-    "This run is interactive. Use the ask tool for plans, reviews, ambiguity, meaningful checkpoints, tradeoffs, and collaborative iteration when a short back-and-forth will improve the result. "
-    "When the user asks for a plan, review, or multi-step collaboration, inspect the relevant code, produce a short plan, then use the ask tool to ask whether the plan is good or what should change if stdin is interactive. "
-    "If the user gives feedback, revise and continue; for longer tasks, it is good to work in 2-3 meaningful batches and use ask between batches when the user wants review checkpoints. "
-    "Do not ask after every trivial step, but do use ask for ambiguous product decisions, plan approval, tradeoffs, collaborative iteration, or when a quick checkpoint would help keep momentum. "
-    "If the task looks likely to require many coordinated edits, a risky refactor, or other broad changes, ask before starting whether the user wants a short summary and commit of the current state so undo is easy. "
-    "If you made changes and are about to finish with a normal status or completion summary, ask 'Would you like me to summarise and commit the work completed?' when stdin is interactive. "
-    "If ask is unavailable, mention the same checkpoint or commit option in your normal response when it would be useful. "
-)
-NONINTERACTIVE_SYSTEM_PROMPT = (
-    "This run is non-interactive. The ask tool is unavailable, so do not pause for approvals, checkpoint questions, or conversational handoffs. "
-    "Focus on completing the prompted work without interruptions, using the workspace and tool results to resolve uncertainty whenever possible. "
-    "Choose reasonable, safe defaults when the repo and prompt provide enough direction, and keep going unless the task is blocked by missing credentials, an irreversible decision, or ambiguity that cannot be resolved from available context. "
-    "Be resilient to recoverable faults: narrow the scope, inspect more, retry with adjusted commands, switch tools, or take a simpler path instead of stopping at the first failure. "
-    "If you do end up blocked, give a concise completion-style status that explains what you tried, what remains blocked, and the smallest useful next step for the operator. "
-)
+BASE_SYSTEM_PROMPT = """You are oy, a tiny local coding assistant.
+
+## Core Principles
+
+- Work simply, inspect before changing, and prefer secure boring solutions.
+- Each run is a fresh session: never assume hidden memory, saved history, or prior conversation state beyond the current prompt and tool results.
+- If the user refers to earlier work and context is missing, ask them to restate or paste it instead of guessing.
+- Keep answers concise but thorough—stay on task until finished or blocked.
+
+## Tool Selection Guide
+
+- **read**: Inspect files before editing. Use offset/limit for large files. Always read first unless you created the file this session.
+- **list/glob**: Discover structure before diving deep. Use list for directories, glob for pattern matching.
+- **grep**: Find code by text or regex. Use before read when you know the pattern but not the location.
+- **apply**: Make file changes. Supports replace (exact string match), write (new files), move, and delete. Batch multiple operations when they're related.
+- **bash**: Run shell commands for builds, tests, git, or package managers. Avoid for file reading—use read instead.
+- **httpx**: Fetch web pages or call APIs. Use preset='json' for APIs, preset='page' for HTML (auto-converts to markdown).
+
+## Output Truncation
+
+Tool output is clipped to preserve context:
+- Most tools: ~16k chars max
+- bash: keeps start AND end when clipped (look for "... [N chars omitted] ..." markers)
+- httpx: ~20k chars
+
+When clipped, narrow your query: use read with offsets, grep, glob, list, or follow-up httpx calls—never guess at missing content.
+
+## File Editing Workflow
+
+1. Read the file first to understand current state.
+2. Use apply with exact string replacement for targeted edits.
+3. For new files, use apply with op='write'.
+4. Batch related operations in a single apply call for atomicity.
+"""
+INTERACTIVE_SYSTEM_PROMPT = """## Interactive Mode
+
+This run is interactive—the ask tool is available for human collaboration.
+
+### When to Use ask
+
+Use ask for:
+- **Plans**: When the user requests a plan, inspect code, draft a short plan, then ask if it looks good.
+- **Ambiguity**: When multiple reasonable approaches exist and user preference matters.
+- **Checkpoints**: For multi-batch work, offer checkpoints between batches.
+- **Risky changes**: Before broad refactors or many coordinated edits, ask if the user wants a summary and commit first (for easy undo).
+- **Completion**: After making changes, ask "Would you like me to summarise and commit the work completed?"
+
+### How to Use ask Efficiently
+
+- Don't ask after every trivial step—batch related work, then checkpoint.
+- For multi-step tasks, work in 2-3 meaningful batches with ask between them.
+- Present clear options when possible: ask("Which approach?", choices=["option A", "option B"])
+- If the user gives feedback, revise and continue.
+
+### Forced Checkpoints
+
+Always ask before:
+- Deleting files (confirm with ask)
+- Making irreversible changes without backups
+- Starting a task that will modify many files
+"""
+NONINTERACTIVE_SYSTEM_PROMPT = """## Non-Interactive Mode
+
+This run is non-interactive—the ask tool is **unavailable**. Do not pause for approvals or checkpoints.
+
+### Autonomy Guidelines
+
+- Complete the prompted work without interruptions.
+- Use workspace inspection (read, grep, glob, list) to resolve uncertainty.
+- Choose reasonable, safe defaults when context provides direction.
+- Keep going unless blocked by: missing credentials, an irreversible decision, or unresolvable ambiguity.
+
+### Error Recovery
+
+Be resilient to recoverable faults:
+- Command fails? → Check error message, adjust command, retry.
+- File not found? → Use grep/glob to locate it.
+- Output truncated? → Narrow the query (read with offset, more specific grep).
+- Tool unsuitable? → Switch to a better tool for the job.
+- Complex approach failing? → Take a simpler path.
+
+### Blocking Conditions
+
+Only stop when truly blocked. If blocked, provide a concise status:
+1. What you tried
+2. What remains blocked
+3. The smallest useful next step for the operator
+
+Never stop at the first failure—always attempt recovery first.
+"""
 BREW_CANDIDATES = [
     Path("/home/linuxbrew/.linuxbrew/bin/brew"),
     Path("/opt/homebrew/bin/brew"),
@@ -202,6 +265,11 @@ def abort(message, code=1):
 
 
 def clip(text, limit=MAX_TOOL_OUTPUT_CHARS, tail_chars=0):
+    """Truncate text to a character limit, optionally preserving tail.
+
+    For bash output, use tail_chars > 0 to show both head and tail with a marker.
+    Otherwise, just truncates at limit with an omission count.
+    """
     if len(text) <= limit:
         return text
     omitted = len(text) - limit
@@ -231,6 +299,10 @@ def compact_markdown(text):
 
 
 def should_markdownify_html(content_type, text):
+    """Determine if HTTP response body should be converted from HTML to markdown.
+
+    Checks content-type header and probes the first 500 chars for HTML markers.
+    """
     lowered = (content_type or "").lower()
     if any(marker in lowered for marker in HTML_MARKERS):
         return True
@@ -452,6 +524,11 @@ def run_cmd(command, cwd=None, env=None, timeout=120):
 
 
 def command_env(cwd=None):
+    """Build environment for shell commands, incorporating mise and homebrew paths.
+
+    Merges PATH entries from mise env --json and homebrew prefix detection.
+    This ensures tools installed via mise or homebrew are available.
+    """
     env, brew_bins = os.environ.copy(), BREW_CANDIDATES.copy()
     if prefix := env.get("HOMEBREW_PREFIX") or os.environ.get("HOMEBREW_PREFIX"):
         brew_bins.insert(0, Path(prefix) / "bin" / "brew")
@@ -525,6 +602,13 @@ def run_aws_sso_login(cwd=None):
 
 
 def load_aws_credentials(cwd=None, allow_login=True):
+    """Load AWS credentials via aws configure export-credentials.
+
+    If SSO session is stale and allow_login is True, attempts automatic refresh
+    via `aws sso login --use-device-code --no-browser`.
+
+    Returns dict with access_key, secret_key, and optionally session_token.
+    """
     result = aws_cli(
         ["configure", "export-credentials", "--format", "process", "--no-cli-pager"],
         cwd=cwd,
@@ -572,6 +656,11 @@ def signing_key(secret_key, date_stamp, region, service):
 
 
 def make_bedrock_token(region, cwd=None, expires=43200):
+    """Generate a Bedrock bearer token using AWS SigV4 signing.
+
+    Takes AWS credentials and produces a token suitable for the Bedrock API.
+    Token is valid for `expires` seconds (default 12 hours).
+    """
     creds = load_aws_credentials(cwd)
     now = datetime.now(timezone.utc)
     amz_date, date_stamp = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
@@ -769,6 +858,11 @@ def get_client(async_=False):
 
 
 def resolve_path(root, raw):
+    """Resolve a path relative to root, preventing escape via .. traversal.
+
+    If the resolved path would escape root, returns root / basename instead.
+    This is a security measure to constrain file access to the workspace.
+    """
     path = (root / raw).resolve()
     return path if path == root or root in path.parents else root / Path(raw).name
 
@@ -1115,43 +1209,72 @@ def tool_ask(state, question, choices=None):
 TOOL_SPECS = {
     "apply": (
         tool_apply,
-        "Apply one or more structured file operations inside the workspace. Supports exact replacements, writes, moves, and deletes.",
+        "Apply one or more structured file operations in the workspace. "
+        "Use for all file modifications. Operations: "
+        "replace (exact string match, requires old and new), "
+        "write (create new file with content, use overwrite=true for existing files), "
+        "move (rename file, requires to path), "
+        "delete (remove file). "
+        "Batch related operations in a single call. Always read the file first before using replace.",
         {"operations": APPLY_OPERATIONS},
         ["operations"],
     ),
     "list": (
         tool_list,
-        "List files and directories in a workspace directory. Use this to inspect unfamiliar paths before reading or writing.",
+        "List files and directories in a workspace directory. "
+        "Use to discover structure before deeper exploration. "
+        "Returns entries sorted alphabetically with trailing / for directories. "
+        "Prefer list over glob when exploring an unfamiliar directory tree.",
         {"path": STR, "limit": INT},
         [],
     ),
     "bash": (
         tool_bash,
-        "Run shell commands for builds, tests, git, or package managers. Avoid using bash for routine file reading, editing, or search.",
+        "Run shell commands for builds, tests, git, or package managers. "
+        "NOT for file reading—use read instead. "
+        "NOT for searching—use grep instead. "
+        "Use for: git operations, npm/pip/make commands, running tests, one-off scripts. "
+        "Output shows both stdout and stderr; clipped output preserves head and tail.",
         {"command": STR, "timeout_seconds": INT},
         ["command"],
     ),
     "read": (
         tool_read,
-        "Read a workspace file or directory listing with optional offsets. Inspect with this before editing and for follow-up slices of large files.",
+        "Read a workspace file or directory listing. "
+        "ALWAYS read before editing—never guess file contents. "
+        "Use offset and limit for large files (line numbers are included). "
+        "For directories, returns the same as list. "
+        "This is the primary file inspection tool.",
         {"path": STR, "offset": INT, "limit": INT},
         ["path"],
     ),
     "grep": (
         tool_grep,
-        "Search workspace file contents with ripgrep or grep. Use this to find code by text or regex before reading specific files.",
+        "Search workspace file contents by text or regex pattern. "
+        "Use before read when you know what to find but not where it is. "
+        "Supports ripgrep (preferred) or standard grep. "
+        "Use file_glob to restrict search to specific file types (e.g., '*.py'). "
+        "Returns matching lines with file paths and line numbers.",
         {"pattern": STR, "path": STR, "file_glob": STR},
         ["pattern"],
     ),
     "glob": (
         tool_glob,
-        "Find files or directories by name pattern. Use this for discovery when you know the path shape but not the exact file.",
+        "Find files or directories by name pattern (e.g., '*.py', 'src/**/*.js'). "
+        "Use when you know the filename pattern but not the exact path. "
+        "For discovering directory structure, prefer list instead. "
+        "Supports standard glob patterns: * any chars, ? single char, ** recursive.",
         {"pattern": STR, "path": STR},
         ["pattern"],
     ),
     "httpx": (
         tool_httpx,
-        "Fetch a page or call an API. Smart defaults infer GET vs POST and text vs JSON; use preset for common cases.",
+        "Fetch web pages or call HTTP APIs. "
+        "Smart defaults: infers GET/POST from body presence, auto-detects JSON responses. "
+        "Presets: 'page' for HTML (auto-converts to markdown), 'json' for API responses, 'post_json' for POST with JSON body. "
+        "Use json_path to extract nested fields (e.g., 'data.items.0.name'). "
+        "Use max_chars to limit output size. "
+        "Headers like Authorization are redacted in output for safety.",
         {
             "url": STR,
             "preset": HTTPX_PRESET,
@@ -1169,7 +1292,11 @@ TOOL_SPECS = {
     ),
     "ask": (
         tool_ask,
-        "Ask the user a question and return their response. Use this for ambiguity, plan approval, review checkpoints, and summary or commit offers before or after substantial work.",
+        "Ask the user a question and return their response. "
+        "Use for: plan approval, ambiguous decisions, checkpoints, commit offers. "
+        "Provide choices for multiple-choice questions (user can enter number or exact text). "
+        "Only available in interactive mode—unavailable when stdin is not a TTY. "
+        "Do not use for trivial decisions; batch work and ask at meaningful checkpoints.",
         {"question": STR, "choices": STRINGS},
         ["question"],
     ),
@@ -1215,8 +1342,8 @@ def chat_tools(tool_specs):
 def parse_tool_arguments(args_str: str) -> dict[str, Any]:
     """Parse tool arguments from LLM output.
 
-    Some LLMs occasionally emit duplicated JSON arguments (e.g., the same object twice).
-    This workaround hunts for valid JSON around the midpoint of malformed responses.
+    Handles malformed output where some LLMs emit duplicated JSON (same object twice).
+    Hunts for valid JSON starting near the midpoint if initial parse fails.
     """
 
     def decode(candidate: str) -> dict[str, Any]:
@@ -1243,6 +1370,11 @@ def parse_tool_arguments(args_str: str) -> dict[str, Any]:
 
 
 def run_tool(state, tool_name, tool_args):
+    """Execute a tool call with the given arguments.
+
+    Returns a string result. Errors are caught and returned as error messages
+    rather than raised, to keep the agent loop running.
+    """
     name = tool_name[5:] if tool_name.startswith("tool_") else tool_name
     tool_specs = state.get("tool_specs", TOOL_SPECS)
     if name not in tool_specs:
@@ -1608,9 +1740,7 @@ def main(argv: list[str] | None = None):
         return 0
     elif args[0] not in commands:
         args = ["run", *args]
-    result = defopt.run(
-        [run, models, model], argv=args, version=False, short={}
-    )
+    result = defopt.run([run, models, model], argv=args, version=False, short={})
     return 0 if result is None else result
 
 
