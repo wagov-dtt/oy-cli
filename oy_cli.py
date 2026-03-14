@@ -155,6 +155,20 @@ def code_block(text, language="text"):
     return f"```{language}\n{body}\n```"
 
 
+def safe_json(data, error_msg="invalid JSON"):
+    """Parse JSON with automatic error conversion."""
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError as exc:
+        raise ValueError(error_msg) from exc
+
+
+def fallback(value, fallback_value):
+    """Return stripped value or fallback if empty."""
+    result = str(value).strip()
+    return result if result else fallback_value
+
+
 def format_bash_result(command, returncode, stdout, stderr):
     """Format bash command output as a pretty markdown block."""
     parts = ["```bash", f"$ {command}"]
@@ -324,7 +338,7 @@ def render_response_headers(headers):
 
 
 def httpx_error_message(exc, timeout_seconds):
-    message = str(exc).strip() or exc.__class__.__name__
+    message = fallback(exc, exc.__class__.__name__)
     lowered = message.lower()
     if isinstance(exc, httpx.TimeoutException):
         return f"request timed out after {timeout_seconds} seconds"
@@ -500,19 +514,7 @@ def aws_cli(parts, cwd=None, timeout=10):
     env = command_env(cwd)
     if not (aws := which("aws", env.get("PATH"))):
         raise RuntimeError("AWS CLI is not installed or not on PATH")
-    try:
-        return subprocess.run(
-            [aws, *parts],
-            cwd=cwd,
-            env=env,
-            text=True,
-            capture_output=True,
-            timeout=max(timeout, 1),
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"AWS credential lookup timed out after {timeout} seconds"
-        ) from exc
+    return run_cmd([aws, *parts], cwd=cwd, env=env, timeout=timeout)
 
 
 def run_aws_sso_login(cwd=None):
@@ -529,23 +531,19 @@ def run_aws_sso_login(cwd=None):
         + (f" for profile {inline_code(profile)}" if profile else "")
         + " with device-code login."
     )
-    try:
-        result = subprocess.run(
-            [
-                aws,
-                "sso",
-                "login",
-                "--use-device-code",
-                "--no-browser",
-                "--no-cli-pager",
-            ],
-            cwd=cwd,
-            env=env,
-            text=True,
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("AWS SSO login timed out after 300 seconds") from exc
+    result = run_cmd(
+        [
+            aws,
+            "sso",
+            "login",
+            "--use-device-code",
+            "--no-browser",
+            "--no-cli-pager",
+        ],
+        cwd=cwd,
+        env=env,
+        timeout=300,
+    )
     if result.returncode:
         raise RuntimeError(f"AWS SSO login failed with exit code {result.returncode}")
 
@@ -570,9 +568,9 @@ def load_aws_credentials(cwd=None, allow_login=True):
             return load_aws_credentials(cwd, False)
         raise RuntimeError(message)
     try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("AWS CLI returned invalid credential JSON") from exc
+        payload = safe_json(result.stdout, "AWS CLI returned invalid credential JSON")
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc.__cause__
     access_key, secret_key, session_token = (
         payload.get("AccessKeyId"),
         payload.get("SecretAccessKey"),
@@ -985,11 +983,11 @@ def tool_grep(state, pattern, path=".", file_glob=None):
             build(exe, pattern, search_path, file_glob), cwd=state["root"], env=env
         )
         if result.returncode not in (0, 1):
-            detail = result.stderr.strip() or result.stdout.strip() or f"{name} failed"
+            detail = fallback(result.stderr, fallback(result.stdout, f"{name} failed"))
             raise ValueError(
                 f"{name} search failed for {rel(state['root'], target)}: {detail}"
             )
-        out = result.stdout.strip() or "<no matches>"
+        out = fallback(result.stdout, "<no matches>")
         show(out, 3)
         return clip(out)
     raise ValueError("grep requires `rg` or `grep` on PATH")
@@ -1710,7 +1708,7 @@ def resolve_model_choice(model_id=None):
         or Prompt.ask("Model or filter", console=STDERR, default=current).strip()
     )
     while True:
-        query = query.strip() or current
+        query = fallback(query, current)
         if query in available:
             return query
         if choice := select_model_by_number(shown, query):
