@@ -19,7 +19,6 @@ import httpx
 from markdownify import markdownify as html_to_markdown
 from openai import AsyncOpenAI, OpenAI
 from openai import (
-    APIStatusError,
     AuthenticationError,
     BadRequestError,
     PermissionDeniedError,
@@ -42,7 +41,6 @@ DEFAULT_REGION = (
 )
 DEFAULT_MAX_STEPS = 512
 DEFAULT_MAX_TOOL_CALLS = 512
-DEFAULT_RESPONSES_MODE = "auto"
 CONFIG_PATH = Path.home() / ".config" / "oy" / "config.json"
 BASE_SYSTEM_PROMPT = (
     "You are oy, a tiny local coding assistant. "
@@ -155,20 +153,6 @@ def code_block(text, language="text"):
     return f"```{language}\n{body}\n```"
 
 
-def safe_json(data, error_msg="invalid JSON"):
-    """Parse JSON with automatic error conversion."""
-    try:
-        return json.loads(data)
-    except json.JSONDecodeError as exc:
-        raise ValueError(error_msg) from exc
-
-
-def fallback(value, fallback_value):
-    """Return stripped value or fallback if empty."""
-    result = str(value).strip()
-    return result if result else fallback_value
-
-
 def format_bash_result(command, returncode, stdout, stderr):
     """Format bash command output as a pretty markdown block."""
     parts = ["```bash", f"$ {command}"]
@@ -187,10 +171,6 @@ def format_bash_result(command, returncode, stdout, stderr):
 def inline_code(text):
     value = str(text).replace("`", "\\`")
     return f"`{value}`"
-
-
-def eprint(text=""):
-    markdown(text, stderr=True)
 
 
 def status(text=""):
@@ -311,17 +291,6 @@ def normalize_mapping(value, name):
     return {str(key): "" if item is None else str(item) for key, item in value.items()}
 
 
-def is_json_content_type(content_type):
-    lowered = (content_type or "").lower()
-    return "application/json" in lowered or "+json" in lowered
-
-
-def render_json_value(value):
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=True, indent=2)
-
-
 def redact_header_value(name, value):
     lowered = name.lower()
     if lowered in {"authorization", "proxy-authorization", "cookie", "set-cookie"}:
@@ -338,7 +307,7 @@ def render_response_headers(headers):
 
 
 def httpx_error_message(exc, timeout_seconds):
-    message = fallback(exc, exc.__class__.__name__)
+    message = str(exc).strip() or exc.__class__.__name__
     lowered = message.lower()
     if isinstance(exc, httpx.TimeoutException):
         return f"request timed out after {timeout_seconds} seconds"
@@ -359,7 +328,9 @@ def render_httpx_output(response, response_mode, json_path=None):
     ]
     mode = response_mode
     if mode == "auto":
-        mode = "json" if json_path or is_json_content_type(content_type) else "body"
+        ct_lowered = (content_type or "").lower()
+        is_json = "application/json" in ct_lowered or "+json" in ct_lowered
+        mode = "json" if json_path or is_json else "body"
     if mode == "headers":
         header_block = render_response_headers(response.headers)
         lines.append("headers:")
@@ -376,7 +347,12 @@ def render_httpx_output(response, response_mode, json_path=None):
                 lines.append(f"json-path: {json_path}")
             lines.append("body-format: json")
             lines.append("")
-            lines.append(render_json_value(payload))
+            body = (
+                payload
+                if isinstance(payload, str)
+                else json.dumps(payload, ensure_ascii=True, indent=2)
+            )
+            lines.append(body)
             return "\n".join(lines)
     body = format_http_text_body(response.text, content_type)
     if body != response.text:
@@ -568,9 +544,9 @@ def load_aws_credentials(cwd=None, allow_login=True):
             return load_aws_credentials(cwd, False)
         raise RuntimeError(message)
     try:
-        payload = safe_json(result.stdout, "AWS CLI returned invalid credential JSON")
-    except ValueError as exc:
-        raise RuntimeError(str(exc)) from exc.__cause__
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("AWS CLI returned invalid credential JSON") from exc
     access_key, secret_key, session_token = (
         payload.get("AccessKeyId"),
         payload.get("SecretAccessKey"),
@@ -676,13 +652,6 @@ def current_model(choice):
 
 def current_region(choice):
     return setting(choice, ("AWS_REGION", "AWS_DEFAULT_REGION"), None, DEFAULT_REGION)
-
-
-def current_responses_mode():
-    mode = (
-        setting(None, ("OY_RESPONSES",), None, DEFAULT_RESPONSES_MODE).strip().lower()
-    )
-    return mode if mode in {"auto", "always", "never"} else DEFAULT_RESPONSES_MODE
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -983,11 +952,11 @@ def tool_grep(state, pattern, path=".", file_glob=None):
             build(exe, pattern, search_path, file_glob), cwd=state["root"], env=env
         )
         if result.returncode not in (0, 1):
-            detail = fallback(result.stderr, fallback(result.stdout, f"{name} failed"))
+            detail = (result.stderr or result.stdout or f"{name} failed").strip()
             raise ValueError(
                 f"{name} search failed for {rel(state['root'], target)}: {detail}"
             )
-        out = fallback(result.stdout, "<no matches>")
+        out = result.stdout.strip() or "<no matches>"
         show(out, 3)
         return clip(out)
     raise ValueError("grep requires `rg` or `grep` on PATH")
@@ -1217,19 +1186,6 @@ def chat_tools(tool_specs):
     ]
 
 
-def responses_tools(tool_specs):
-    return [
-        {
-            "type": "function",
-            "name": name,
-            "description": desc,
-            "parameters": {"type": "object", "properties": props, "required": required},
-            "strict": False,
-        }
-        for name, (_, desc, props, required) in tool_specs.items()
-    ]
-
-
 def parse_tool_arguments(args_str: str) -> dict[str, Any]:
     """Parse tool arguments from LLM output.
 
@@ -1258,39 +1214,6 @@ def parse_tool_arguments(args_str: str) -> dict[str, Any]:
                 except json.JSONDecodeError, ValueError:
                     pass
         raise exc
-
-
-class ResponsesFallback(Exception):
-    def __init__(self, reason: str):
-        super().__init__(reason)
-        self.reason = reason
-
-
-def responses_fallback_reason(exc):
-    if not isinstance(exc, APIStatusError):
-        return None
-    text = " ".join(str(exc).split())
-    fallback = exc.status_code in {404, 405, 415, 422, 501} or (
-        exc.status_code == 400
-        and any(
-            marker in text.lower()
-            for marker in (
-                "responses",
-                "/responses",
-                "unsupported",
-                "not support",
-                "not implemented",
-                "unknown parameter",
-                "unrecognized",
-                "extra inputs are not permitted",
-            )
-        )
-    )
-    if not fallback:
-        return None
-    request_id = getattr(exc, "request_id", None)
-    detail = preview(f"{exc.status_code}: {text or 'responses API unsupported'}", 180)
-    return f"{detail} [{request_id}]" if request_id else detail
 
 
 def run_tool(state, tool_name, tool_args):
@@ -1333,12 +1256,9 @@ def message_size(msg) -> int:
     return len(str(msg))
 
 
-def session_size(session, kind: str) -> int:
+def session_size(messages: list) -> int:
     """Calculate total size of messages in a session."""
-    if kind == "chat":
-        return sum(message_size(msg) for msg in cast(list, session))
-    # responses mode
-    return sum(message_size(msg) for msg in cast(dict, session).get("input", []))
+    return sum(message_size(msg) for msg in messages)
 
 
 def format_size(chars: int) -> str:
@@ -1355,20 +1275,9 @@ def list_model_ids():
     return sorted(model.id for model in list(cast(OpenAI, get_client()).models.list()))
 
 
-async def run_turn(
-    client,
-    kind,
-    session,
-    state,
-    model,
-    system_prompt,
-    chat_tool_defs,
-    responses_tool_defs,
-    max_steps,
-    allow_fallback=False,
-):
+async def run_turn(client, messages, state, model, tool_defs, max_steps):
     for _ in range(max_steps):
-        size = session_size(session, kind)
+        size = session_size(messages)
         size_str = format_size(size)
         spinner = Status(
             f"Waiting for {model} · {size_str}",
@@ -1377,93 +1286,36 @@ async def run_turn(
         )
         spinner.start()
         try:
-            if kind == "chat":
-                response = await cast(AsyncOpenAI, client).chat.completions.create(
-                    model=model,
-                    messages=session,
-                    tools=chat_tool_defs,
-                    tool_choice="auto",
-                )  # type: ignore[arg-type]
-            else:
-                try:
-                    response = await cast(AsyncOpenAI, client).responses.create(
-                        model=model,
-                        instructions=system_prompt,
-                        input=session["input"],
-                        tools=responses_tool_defs,
-                        tool_choice="auto",
-                    )  # type: ignore[arg-type]
-                except Exception as exc:
-                    reason = responses_fallback_reason(exc)
-                    if allow_fallback and not session["tool_used"] and reason:
-                        raise ResponsesFallback(reason) from exc
-                    raise
+            response = await cast(AsyncOpenAI, client).chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=tool_defs,
+                tool_choice="auto",
+            )  # type: ignore[arg-type]
         finally:
             spinner.stop()
-        # Process response after spinner has stopped
-        if kind == "chat":
-            message = response.choices[0].message.model_dump(exclude_none=True)
-            calls = []
-            for call in message.get("tool_calls") or []:
-                if call.get("type") != "function":
-                    continue
-                function = call["function"]
-                tool_args = parse_tool_arguments(function["arguments"])
-                function["arguments"] = json.dumps(tool_args)
-                calls.append((call["id"], function["name"], tool_args))
-            output = message.get("content") or ""
-            output = (
-                output
-                if isinstance(output, str)
-                else json.dumps(output, ensure_ascii=True)
-            )
-            if calls:
-                session.append(message)
-        else:
-            calls, output = [], response.output_text or ""
-            for item in cast(Any, response.output):
-                if getattr(item, "type", None) == "message":
-                    payload = {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [
-                            part.model_dump(exclude_none=True)
-                            for part in cast(Any, item).content
-                        ],
-                    }
-                    if getattr(item, "phase", None):
-                        payload["phase"] = item.phase
-                    session["input"].append(payload)
-                elif getattr(item, "type", None) == "function_call":
-                    args = parse_tool_arguments(item.arguments)
-                    session["input"].append(
-                        {
-                            "type": "function_call",
-                            "call_id": item.call_id,
-                            "name": item.name,
-                            "arguments": json.dumps(args),
-                        }
-                    )
-                    calls.append((item.call_id, item.name, args))
+        message = response.choices[0].message.model_dump(exclude_none=True)
+        calls = []
+        for call in message.get("tool_calls") or []:
+            if call.get("type") != "function":
+                continue
+            function = call["function"]
+            tool_args = parse_tool_arguments(function["arguments"])
+            function["arguments"] = json.dumps(tool_args)
+            calls.append((call["id"], function["name"], tool_args))
+        output = message.get("content") or ""
+        output = (
+            output if isinstance(output, str) else json.dumps(output, ensure_ascii=True)
+        )
         if calls:
+            messages.append(message)
             results = [
                 (call_id, run_tool(state, name, args)) for call_id, name, args in calls
             ]
-            if kind == "chat":
-                session.extend(
-                    {"role": "tool", "tool_call_id": call_id, "content": result}
-                    for call_id, result in results
-                )
-            else:
-                session["tool_used"] = True
-                session["input"].extend(
-                    {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": result,
-                    }
-                    for call_id, result in results
-                )
+            messages.extend(
+                {"role": "tool", "tool_call_id": call_id, "content": result}
+                for call_id, result in results
+            )
             continue
         render_markdown(output)
         return 0, output
@@ -1480,79 +1332,22 @@ async def run_agent(
         "max_tool_calls": max_tool_calls,
         "tool_specs": tool_specs,
     }
-    chat_tool_defs = chat_tools(tool_specs)
-    responses_tool_defs = responses_tools(tool_specs)
-    chat = [
+    tool_defs = chat_tools(tool_specs)
+    messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
-    responses = {
-        "input": [{"type": "message", "role": "user", "content": prompt}],
-        "tool_used": False,
-    }
 
-    async def run_mode(client):
-        mode = current_responses_mode()
-        if mode == "never":
-            return await run_turn(
-                client,
-                "chat",
-                chat,
-                state,
-                model,
-                system_prompt,
-                chat_tool_defs,
-                responses_tool_defs,
-                max_steps,
-            )
-        if mode == "always":
-            return await run_turn(
-                client,
-                "responses",
-                responses,
-                state,
-                model,
-                system_prompt,
-                chat_tool_defs,
-                responses_tool_defs,
-                max_steps,
-            )
-        try:
-            return await run_turn(
-                client,
-                "responses",
-                responses,
-                state,
-                model,
-                system_prompt,
-                chat_tool_defs,
-                responses_tool_defs,
-                max_steps,
-                True,
-            )
-        except ResponsesFallback as exc:
-            warning(
-                f"Responses API unavailable ({exc.reason}). Falling back to Chat Completions."
-            )
-            return await run_turn(
-                client,
-                "chat",
-                chat,
-                state,
-                model,
-                system_prompt,
-                chat_tool_defs,
-                responses_tool_defs,
-                max_steps,
-            )
+    async def run_with_client(client):
+        return await run_turn(client, messages, state, model, tool_defs, max_steps)
 
     try:
-        return await run_mode(get_client(async_=True))
+        return await run_with_client(get_client(async_=True))
     except (AuthenticationError, PermissionDeniedError) as exc:
         if ensure_api_env(root, refresh=True):
             warning("Bedrock token expired. Refreshing credentials.")
             try:
-                return await run_mode(get_client(async_=True))
+                return await run_with_client(get_client(async_=True))
             except (AuthenticationError, PermissionDeniedError) as retry_exc:
                 kind = (
                     "authentication"
@@ -1708,7 +1503,7 @@ def resolve_model_choice(model_id=None):
         or Prompt.ask("Model or filter", console=STDERR, default=current).strip()
     )
     while True:
-        query = fallback(query, current)
+        query = query.strip() or current
         if query in available:
             return query
         if choice := select_model_by_number(shown, query):

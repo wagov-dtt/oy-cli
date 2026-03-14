@@ -40,7 +40,6 @@ export OY_MODEL=zai.glm-5
 export OY_NON_INTERACTIVE=1
 export OY_SYSTEM_FILE=./ops/system.txt
 export OY_ROOT=/path/to/workspace
-export OY_RESPONSES=auto
 oy "fix the failing test"
 ```
 
@@ -48,7 +47,6 @@ oy "fix the failing test"
 - `OY_NON_INTERACTIVE=1`: disable `ask` and run straight through without checkpoints
 - `OY_SYSTEM_FILE`: append extra system instructions from a file
 - `OY_ROOT`: run against a workspace without changing shell directories
-- `OY_RESPONSES=auto|always|never`: control Responses API fallback behavior
 - `OY_CONFIG`: override the config file path used for persisted settings like the default model
 
 ## Requirements
@@ -105,10 +103,6 @@ For OpenAI-compatible endpoints:
 export OPENAI_BASE_URL=https://your-endpoint.example/v1
 export OPENAI_API_KEY=...
 ```
-
-`oy` tries the Responses API first and falls back to Chat Completions when the
-provider rejects it before any tool runs. Override with
-`OY_RESPONSES=auto|always|never`.
 
 ## Commands
 

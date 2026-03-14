@@ -28,7 +28,7 @@ mise run build
 - intended end-user install path: `uv tool install oy-cli`
 - current design goal: keep the implementation small and easy to audit
 - prefer env-first run configuration so common usage stays close to `oy "prompt"`
-- current run env vars: `OY_MODEL`, `OY_NON_INTERACTIVE`, `OY_SYSTEM_FILE`, `OY_ROOT`, `OY_RESPONSES`, `OY_CONFIG`
+- current run env vars: `OY_MODEL`, `OY_NON_INTERACTIVE`, `OY_SYSTEM_FILE`, `OY_ROOT`, `OY_CONFIG`
 - prefer simple, direct changes over abstraction-heavy rewrites
 
 ## Release Hygiene
