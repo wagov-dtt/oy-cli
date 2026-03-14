@@ -136,47 +136,51 @@ AUDIT_SYSTEM_PROMPT = """## Security and Complexity Audit
 
 You are conducting a security and code quality audit of this repository.
 
-### Get Current Standards
+### Process
 
-Use httpx to fetch the latest verification standards before auditing:
-
-- **ASVS** (Application Security Verification Standard): https://raw.githubusercontent.com/OWASP/ASVS/master/README.md
-- **MSVS** (Mobile Security Verification Standard): https://raw.githubusercontent.com/OWASP/owasp-masvs/master/README.md
-- **OWASP Top 10**: https://owasp.org/Top10/
-
-Start by fetching these resources to ensure your audit reflects current guidance.
-
-### Audit Process
-
-1. Fetch current ASVS/MSVS standards via httpx
+1. Fetch current OWASP ASVS/MSVS standards via httpx:
+   - ASVS: https://raw.githubusercontent.com/OWASP/ASVS/master/README.md
+   - MSVS: https://raw.githubusercontent.com/OWASP/owasp-masvs/master/README.md
 2. Explore the repository structure systematically
 3. Read and analyze all source code files
-4. Identify security vulnerabilities against ASVS/MSVS requirements
-5. Evaluate code complexity (simplicity, maintainability, avoid over-engineering)
-6. Prioritize issues by severity and actionability
-7. Document findings with specific file paths and line numbers
+4. Identify security vulnerabilities and code complexity issues
+5. Prioritize issues by severity (critical/high/medium/low)
 
-### Output Requirements
+### Output: ISSUES.md
 
-You MUST produce a final report in this exact format:
+Use the apply tool to write findings directly to ISSUES.md in this format:
 
+```markdown
+# Audit Findings
+
+> Last audit: [timestamp]
+
+## Summary
+
+Total issues found: [count]
+
+## Critical Severity (N)
+
+### 1. [Title]
+
+- **Location**: `file:line`
+- **Category**: security|complexity
+- **Standard**: ASVS V5: Security Configuration
+
+[Description]
+
+**Recommendation**: [Action to fix]
+
+**Status**: OPEN
+
+---
+
+## High Severity (N)
+...
 ```
-## Audit Complete
 
-[FINDINGS_JSON]
-```
-
-Where [FINDINGS_JSON] is a JSON array of 15 or fewer findings, each with:
-- "title": Brief issue title
-- "severity": "critical", "high", "medium", or "low"
-- "file": File path relative to repository root
-- "line": Line number (integer)
-- "description": What the issue is and why it matters
-- "recommendation": Specific action to fix it
-- "standard": ASVS/MSVS chapter reference (e.g., "ASVS V5: Security Configuration") or "complexity" for code quality issues
-- "category": "security" or "complexity"
-
-Do NOT output anything after the findings JSON. The JSON must be the last thing in your response.
+Include a `**Status**: OPEN` line for each finding so humans can track progress.
+Append to any existing content in ISSUES.md; do not delete human-added notes.
 """
 BREW_CANDIDATES = [
     Path("/home/linuxbrew/.linuxbrew/bin/brew"),
@@ -1569,91 +1573,6 @@ def read_system_prompt(system_file, interactive):
     return system_prompt + "\n\n" + extra
 
 
-def parse_audit_findings(output: str) -> list[dict]:
-    """Parse audit findings JSON from the LLM output."""
-    import re
-
-    # Try to find JSON array in the output
-    matches = list(re.finditer(r'\[\s*\{.*?\}\s*\]', output, re.DOTALL))
-    if not matches:
-        return []
-
-    json_str = matches[-1].group(0)
-    try:
-        findings = json.loads(json_str)
-        if isinstance(findings, list):
-            return [f for f in findings if isinstance(f, dict)]
-    except json.JSONDecodeError:
-        pass
-    return []
-
-
-def write_issues_file(root: Path, findings: list[dict]) -> None:
-    """Write or update ISSUES.md with audit findings."""
-    issues_path = root / "ISSUES.md"
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    new_content = f"""# Audit Findings
-
-> Last audit: {timestamp}
-
-## Summary
-
-Total issues found: {len(findings)}
-
-"""
-
-    by_severity = {"critical": [], "high": [], "medium": [], "low": []}
-    for f in findings:
-        sev = f.get("severity", "low").lower()
-        if sev in by_severity:
-            by_severity[sev].append(f)
-
-    for sev in ["critical", "high", "medium", "low"]:
-        items = by_severity[sev]
-        if not items:
-            continue
-        new_content += f"## {sev.title()} Severity ({len(items)})\n\n"
-        for i, f in enumerate(items, 1):
-            title = f.get("title", "Untitled issue")
-            file_path = f.get("file", "")
-            line = f.get("line", 0)
-            desc = f.get("description", "")
-            rec = f.get("recommendation", "")
-            owasp = f.get("owasp_link", "")
-            standard = f.get("standard", "")
-            cat = f.get("category", "unknown")
-
-            location = f"{file_path}:{line}" if file_path and line else file_path or "Unknown location"
-            new_content += f"### {i}. {title}\n\n"
-            new_content += f"- **Location**: `{location}`\n"
-            new_content += f"- **Category**: {cat}\n"
-            if standard:
-                new_content += f"- **Standard**: {standard}\n"
-            elif owasp:
-                new_content += f"- **OWASP**: [{owasp}]({owasp})\n"
-            new_content += f"\n{desc}\n\n"
-            if rec:
-                new_content += f"**Recommendation**: {rec}\n\n"
-            new_content += "---\n\n"
-
-    new_content += "---\n\n*This audit used OWASP ASVS/MSVS standards fetched at audit time.*\n"
-
-    if issues_path.exists():
-        existing = issues_path.read_text(encoding="utf-8")
-        import re
-        pattern = r'\n*# Audit Findings\n.*'
-        preserved = re.sub(pattern, '', existing, flags=re.DOTALL)
-        if preserved.strip():
-            final_content = preserved.rstrip() + "\n\n" + new_content
-        else:
-            final_content = new_content
-    else:
-        final_content = new_content
-
-    issues_path.write_text(final_content, encoding="utf-8")
-
-
 def audit(prompt: str = ""):
     """Run a security and complexity audit of the repository.
 
@@ -1666,10 +1585,9 @@ def audit(prompt: str = ""):
     require_runtime(workspace)
     chosen_model = current_model(None)
 
-    audit_prompt = "Conduct a comprehensive security and complexity audit of this repository."
+    audit_prompt = "Conduct a security and complexity audit."
     if prompt:
-        audit_prompt += f"\n\nAdditional focus: {prompt}"
-    audit_prompt += "\n\nFetch current ASVS (Application Security Verification Standard) and MSVS (Mobile Security Verification Standard) via httpx. Explore the repository, identify security issues against ASVS/MSVS requirements, evaluate code complexity, and produce exactly 15 actionable findings with file/line references and standard references."
+        audit_prompt += f" Additional focus: {prompt}"
 
     intro = [
         "## Audit",
@@ -1677,11 +1595,12 @@ def audit(prompt: str = ""):
         f"- workspace: {inline_code(workspace)}",
         f"- model: {inline_code(chosen_model)}",
         f"- mode: {inline_code('non-interactive')}",
-        f"- focus: {inline_code(preview(audit_prompt, 100))}",
     ]
+    if prompt:
+        intro.append(f"- focus: {inline_code(preview(prompt, 100))}")
     markdown("\n".join(intro), stderr=True)
 
-    code, output = asyncio.run(
+    code, _ = asyncio.run(
         run_agent(
             audit_prompt,
             chosen_model,
@@ -1693,20 +1612,7 @@ def audit(prompt: str = ""):
         )
     )
 
-    if code != 0:
-        return code
-
-    findings = parse_audit_findings(output)
-
-    if not findings:
-        warning("No valid findings JSON found in audit output.")
-        return 1
-
-    findings = findings[:15]
-    write_issues_file(workspace, findings)
-    status(f"Wrote {len(findings)} findings to ISSUES.md")
-
-    return 0
+    return code
 
 
 def run(
